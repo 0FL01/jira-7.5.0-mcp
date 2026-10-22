@@ -3,7 +3,10 @@ package jiramcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -19,6 +22,7 @@ type ReadArgs struct {
 	Resource string `json:"resource,omitempty" jsonschema:"Resource to read: projects, boards, sprints, sprint_issues, attachment. Mutually exclusive with keys and jql."`
 
 	AttachmentID string `json:"attachment_id,omitempty" jsonschema:"Decimal attachment ID. Required for resource=attachment. Discover IDs using fields=attachment on an issue."`
+	DownloadDir  string `json:"download_dir,omitempty" jsonschema:"Existing absolute directory on the MCP server filesystem. Only for resource=attachment: save the image here and return its path instead of image content. Delete the file after local viewing."`
 
 	BoardID     int    `json:"board_id,omitempty" jsonschema:"Board ID. Required for resource=sprints."`
 	SprintID    int    `json:"sprint_id,omitempty" jsonschema:"Sprint ID. Required for resource=sprint_issues."`
@@ -43,7 +47,9 @@ var readTool = &mcp.Tool{
 
 Screenshots: first {"keys":["PROJ-1"],"fields":"summary,description,attachment"} to discover metadata,
 then {"resource":"attachment","attachment_id":"12345"} to view one native image.
-PNG/JPEG/GIF only, up to 5 MiB and 2048x2048. Original bytes, no resizing, disk storage, or cache.
+To download instead, add "download_dir":"/absolute/path/to/workspace". The directory must exist.
+Returns a unique saved file path, MIME type, and size without image/base64 content; open it with a local image reader and delete it when finished.
+PNG/JPEG/GIF only, up to 5 MiB and 2048x2048. Original bytes, no resizing or cache. No disk storage unless download_dir is provided.
 
 Common options: fields (comma-separated), expand, limit (default 100), start_at.
 Hint: Use jira_schema resource=transitions with an issue_key to find valid transition IDs before transitioning.`,
@@ -70,6 +76,9 @@ func (h *handlers) handleRead(ctx context.Context, _ *mcp.CallToolRequest, args 
 	}
 	if modes > 1 {
 		return textResult("Provide exactly one of: keys, jql, or resource — not multiple.", true), nil, nil
+	}
+	if args.DownloadDir != "" && args.Resource != "attachment" {
+		return textResult("download_dir is only supported for resource=attachment.", true), nil, nil
 	}
 
 	switch {
@@ -186,9 +195,31 @@ func (h *handlers) readAttachment(ctx context.Context, args ReadArgs) *mcp.CallT
 	if args.AttachmentID == "" {
 		return textResult("attachment_id is required for resource=attachment. Hint: Fetch an issue with fields=attachment to find attachment IDs.", true)
 	}
+	if args.DownloadDir != "" && !filepath.IsAbs(args.DownloadDir) {
+		return textResult("download_dir must be an absolute path to an existing directory on the MCP server filesystem.", true)
+	}
 	data, mimeType, err := h.client.GetAttachmentImage(ctx, args.AttachmentID)
 	if err != nil {
 		return textResult(fmt.Sprintf("Failed to read attachment %s: %v", args.AttachmentID, err), true)
+	}
+	if args.DownloadDir != "" {
+		extension := strings.TrimPrefix(mimeType, "image/")
+		file, err := os.CreateTemp(args.DownloadDir, fmt.Sprintf("jira-attachment-%s-*.%s", args.AttachmentID, extension))
+		if err != nil {
+			return textResult(fmt.Sprintf("Failed to save attachment %s: %v", args.AttachmentID, err), true)
+		}
+		_, writeErr := file.Write(data)
+		closeErr := file.Close()
+		if err := errors.Join(writeErr, closeErr); err != nil {
+			removeErr := os.Remove(file.Name())
+			return textResult(fmt.Sprintf("Failed to save attachment %s: %v", args.AttachmentID, errors.Join(err, removeErr)), true)
+		}
+		return formatReadResult("Saved attachment "+args.AttachmentID+". Open the path with a local image reader and delete the file when finished.", []map[string]any{{
+			"id":       args.AttachmentID,
+			"path":     file.Name(),
+			"mimeType": mimeType,
+			"size":     len(data),
+		}}, nil)
 	}
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{

@@ -2,7 +2,11 @@ package jiramcp
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -372,6 +376,98 @@ func TestReadAttachment_MissingID(t *testing.T) {
 	text, isErr := callRead(t, h, ReadArgs{Resource: "attachment"})
 	assert.True(t, isErr)
 	assert.Contains(t, text, "attachment_id is required")
+}
+
+func TestReadAttachment_Download(t *testing.T) {
+	dir := t.TempDir()
+	original := []byte("original image bytes")
+	h := &handlers{client: &mockClient{
+		GetAttachmentImageFn: func(_ context.Context, id string) ([]byte, string, error) {
+			assert.Equal(t, "12345", id)
+			return original, "image/png", nil
+		},
+	}}
+	var paths []string
+	for range 2 {
+		result, output, err := h.handleRead(context.Background(), nil, ReadArgs{
+			Resource: "attachment", AttachmentID: "12345", DownloadDir: dir,
+		})
+		require.NoError(t, err)
+		assert.Nil(t, output)
+		assert.Nil(t, result.StructuredContent)
+		assert.False(t, result.IsError)
+		require.Len(t, result.Content, 1)
+		text, ok := result.Content[0].(*mcp.TextContent)
+		require.True(t, ok)
+		parts := strings.SplitN(text.Text, "\n\n", 2)
+		require.Len(t, parts, 2)
+		var records []map[string]any
+		require.NoError(t, json.Unmarshal([]byte(parts[1]), &records))
+		require.Len(t, records, 1)
+		assert.Equal(t, "12345", records[0]["id"])
+		assert.Equal(t, "image/png", records[0]["mimeType"])
+		assert.Equal(t, float64(len(original)), records[0]["size"])
+		path, ok := records[0]["path"].(string)
+		require.True(t, ok)
+		assert.Equal(t, dir, filepath.Dir(path))
+		assert.True(t, strings.HasPrefix(filepath.Base(path), "jira-attachment-12345-"))
+		assert.Equal(t, ".png", filepath.Ext(path))
+		paths = append(paths, path)
+	}
+	assert.NotEqual(t, paths[0], paths[1], "repeated downloads must not overwrite an earlier file")
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		require.NoError(t, err)
+		assert.Equal(t, original, data)
+		info, err := os.Stat(path)
+		require.NoError(t, err)
+		assert.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+	}
+}
+
+func TestReadAttachment_DownloadErrors(t *testing.T) {
+	dir := t.TempDir()
+	notDirectory := filepath.Join(dir, "existing.txt")
+	require.NoError(t, os.WriteFile(notDirectory, []byte("unchanged"), 0o600))
+	for _, tt := range []struct {
+		name      string
+		directory string
+		clientErr error
+		want      string
+		wantCalls int
+	}{
+		{"relative directory", "relative/workspace", nil, "download_dir must be an absolute path", 0},
+		{"missing directory", filepath.Join(dir, "missing"), nil, "Failed to save attachment", 1},
+		{"not a directory", notDirectory, nil, "Failed to save attachment", 1},
+		{"client error", dir, fmt.Errorf("not found"), "Failed to read attachment 12345: not found", 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			calls := 0
+			h := &handlers{client: &mockClient{
+				GetAttachmentImageFn: func(context.Context, string) ([]byte, string, error) {
+					calls++
+					return []byte("original image bytes"), "image/png", tt.clientErr
+				},
+			}}
+			text, isErr := callRead(t, h, ReadArgs{Resource: "attachment", AttachmentID: "12345", DownloadDir: tt.directory})
+			assert.True(t, isErr)
+			assert.Contains(t, text, tt.want)
+			assert.Equal(t, tt.wantCalls, calls)
+			entries, err := os.ReadDir(dir)
+			require.NoError(t, err)
+			require.Len(t, entries, 1, "failed downloads must not create files or directories")
+			data, err := os.ReadFile(notDirectory)
+			require.NoError(t, err)
+			assert.Equal(t, "unchanged", string(data))
+		})
+	}
+}
+
+func TestHandleRead_DownloadDirRequiresAttachment(t *testing.T) {
+	h := &handlers{client: &mockClient{}}
+	text, isErr := callRead(t, h, ReadArgs{Resource: "projects", DownloadDir: t.TempDir()})
+	assert.True(t, isErr)
+	assert.Contains(t, text, "download_dir is only supported for resource=attachment")
 }
 
 func TestReadAttachment_ClientError(t *testing.T) {
