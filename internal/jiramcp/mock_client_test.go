@@ -12,6 +12,7 @@ import (
 // test needs; unset methods panic with a clear message.
 type mockClient struct {
 	GetIssueFn           func(ctx context.Context, key string, opts *jira.GetQueryOptions) (*jira.Issue, error)
+	GetAttachmentImageFn func(ctx context.Context, id string) ([]byte, string, error)
 	SearchIssuesFn       func(ctx context.Context, jql string, opts *jira.SearchOptionsV2) (*jira.SearchResultV2, error)
 	CreateIssueV2Fn      func(ctx context.Context, payload map[string]any) (string, string, error)
 	UpdateIssueV2Fn      func(ctx context.Context, key string, payload map[string]any) error
@@ -34,6 +35,13 @@ func (m *mockClient) GetIssue(ctx context.Context, key string, opts *jira.GetQue
 		panic(fmt.Sprintf("mockClient.GetIssue called but GetIssueFn not set (key=%s)", key))
 	}
 	return m.GetIssueFn(ctx, key, opts)
+}
+
+func (m *mockClient) GetAttachmentImage(ctx context.Context, id string) ([]byte, string, error) {
+	if m.GetAttachmentImageFn == nil {
+		panic(fmt.Sprintf("mockClient.GetAttachmentImage called but GetAttachmentImageFn not set (id=%s)", id))
+	}
+	return m.GetAttachmentImageFn(ctx, id)
 }
 
 func (m *mockClient) SearchIssues(ctx context.Context, jql string, opts *jira.SearchOptionsV2) (*jira.SearchResultV2, error) {

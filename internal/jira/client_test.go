@@ -1,9 +1,12 @@
 package jira
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/png"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -33,6 +36,108 @@ func newTestClient(t *testing.T, serverURL string) *Client {
 	c, err := New(cfg)
 	require.NoError(t, err)
 	return c
+}
+
+func TestGetAttachmentImage(t *testing.T) {
+	var original bytes.Buffer
+	require.NoError(t, png.Encode(&original, image.NewRGBA(image.Rect(0, 0, 2, 1))))
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/jira/secure/attachment/12345/", r.URL.Path)
+		username, password, ok := r.BasicAuth()
+		assert.True(t, ok)
+		assert.Equal(t, "test@example.com", username)
+		assert.Equal(t, "token", password)
+		calls++
+		if calls == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		// MIME is derived from the image, not from an unreliable server header.
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write(original.Bytes())
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv.URL+"/jira")
+	data, mimeType, err := c.GetAttachmentImage(context.Background(), "12345")
+	require.NoError(t, err)
+	assert.Equal(t, original.Bytes(), data)
+	assert.Equal(t, "image/png", mimeType)
+	assert.Equal(t, 2, calls)
+}
+
+func TestGetAttachmentImage_RejectsUnsafeImages(t *testing.T) {
+	var wide bytes.Buffer
+	require.NoError(t, png.Encode(&wide, image.NewRGBA(image.Rect(0, 0, 2049, 1))))
+	for _, tt := range []struct {
+		name string
+		body []byte
+		want string
+	}{
+		{"too large", bytes.Repeat([]byte{'x'}, (5<<20)+1), "exceeds 5 MiB"},
+		{"dimensions", wide.Bytes(), "2049x1"},
+		{"login page", []byte("<html>Sign in</html>"), "not a supported PNG, JPEG, or GIF"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "image/png")
+				// Force chunked transfer: the byte cap must not rely on Content-Length.
+				w.(http.Flusher).Flush()
+				_, _ = w.Write(tt.body)
+			}))
+			defer srv.Close()
+
+			c := newTestClient(t, srv.URL)
+			data, mimeType, err := c.GetAttachmentImage(context.Background(), "12345")
+			require.ErrorContains(t, err, tt.want)
+			assert.Nil(t, data)
+			assert.Empty(t, mimeType)
+		})
+	}
+}
+
+func TestGetAttachmentImage_InvalidID(t *testing.T) {
+	c := &Client{}
+	for _, id := range []string{"", "../123", "https://example.com/image.png"} {
+		_, _, err := c.GetAttachmentImage(context.Background(), id)
+		require.ErrorContains(t, err, "attachment_id")
+	}
+}
+
+func TestGetAttachmentImage_Redirects(t *testing.T) {
+	var original bytes.Buffer
+	require.NoError(t, png.Encode(&original, image.NewRGBA(image.Rect(0, 0, 1, 1))))
+	foreignCalls := 0
+	foreign := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		foreignCalls++
+		_, _ = w.Write(original.Bytes())
+	}))
+	defer foreign.Close()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/secure/attachment/1/":
+			http.Redirect(w, r, "/image", http.StatusFound)
+		case "/secure/attachment/2/":
+			http.Redirect(w, r, foreign.URL+"/image", http.StatusFound)
+		case "/secure/attachment/3/":
+			http.Redirect(w, r, r.URL.Path, http.StatusFound)
+		default:
+			_, _ = w.Write(original.Bytes())
+		}
+	}))
+	defer srv.Close()
+	c := newTestClient(t, srv.URL)
+
+	data, _, err := c.GetAttachmentImage(context.Background(), "1")
+	require.NoError(t, err)
+	assert.Equal(t, original.Bytes(), data)
+	_, _, err = c.GetAttachmentImage(context.Background(), "2")
+	require.ErrorContains(t, err, "cross-origin")
+	assert.Zero(t, foreignCalls, "credentials must never reach a foreign origin")
+	_, _, err = c.GetAttachmentImage(context.Background(), "3")
+	require.ErrorContains(t, err, "stopped after 10 redirects")
 }
 
 // --- shouldRetry ---

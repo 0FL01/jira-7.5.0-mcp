@@ -344,6 +344,47 @@ func TestReadSprintIssues_NoSprintID(t *testing.T) {
 	assert.Contains(t, text, "sprint_id is required")
 }
 
+// --- readResource: attachment ---
+
+func TestReadAttachment_Image(t *testing.T) {
+	original := []byte("original image bytes")
+	h := &handlers{client: &mockClient{
+		GetAttachmentImageFn: func(_ context.Context, id string) ([]byte, string, error) {
+			assert.Equal(t, "12345", id)
+			return original, "image/png", nil
+		},
+	}}
+	result, output, err := h.handleRead(context.Background(), nil, ReadArgs{Resource: "attachment", AttachmentID: "12345"})
+	require.NoError(t, err)
+	assert.Nil(t, output)
+	assert.Nil(t, result.StructuredContent)
+	assert.False(t, result.IsError)
+	require.Len(t, result.Content, 2)
+	assert.Equal(t, "Attachment 12345", result.Content[0].(*mcp.TextContent).Text)
+	img, ok := result.Content[1].(*mcp.ImageContent)
+	require.True(t, ok)
+	assert.Equal(t, original, img.Data)
+	assert.Equal(t, "image/png", img.MIMEType)
+}
+
+func TestReadAttachment_MissingID(t *testing.T) {
+	h := &handlers{client: &mockClient{}}
+	text, isErr := callRead(t, h, ReadArgs{Resource: "attachment"})
+	assert.True(t, isErr)
+	assert.Contains(t, text, "attachment_id is required")
+}
+
+func TestReadAttachment_ClientError(t *testing.T) {
+	h := &handlers{client: &mockClient{
+		GetAttachmentImageFn: func(context.Context, string) ([]byte, string, error) {
+			return nil, "", fmt.Errorf("not found")
+		},
+	}}
+	text, isErr := callRead(t, h, ReadArgs{Resource: "attachment", AttachmentID: "12345"})
+	assert.True(t, isErr)
+	assert.Contains(t, text, "Failed to read attachment 12345: not found")
+}
+
 // --- readResource: unknown ---
 
 func TestReadResource_Unknown(t *testing.T) {
@@ -373,6 +414,10 @@ func TestIssueToMap_AllFields(t *testing.T) {
 			Labels:      []string{"backend"},
 			Created:     jira.Time(created),
 			Updated:     jira.Time(updated),
+			Attachments: []*jira.Attachment{
+				nil,
+				{ID: "12345", Filename: "screen.png", MimeType: "image/png", Size: 42, Content: "https://jira.example.com/secure/attachment/12345/screen.png"},
+			},
 		},
 	}
 
@@ -390,6 +435,10 @@ func TestIssueToMap_AllFields(t *testing.T) {
 	assert.Equal(t, []string{"backend"}, fields["labels"])
 	assert.Equal(t, created.Format(time.RFC3339), fields["created"])
 	assert.Equal(t, updated.Format(time.RFC3339), fields["updated"])
+	assert.Equal(t, []map[string]any{{
+		"id": "12345", "filename": "screen.png", "mimeType": "image/png", "size": 42,
+		"content": "https://jira.example.com/secure/attachment/12345/screen.png",
+	}}, fields["attachment"])
 }
 
 func TestIssueToMap_NilFields(t *testing.T) {
@@ -414,6 +463,13 @@ func TestIssueToMap_MinimalFields(t *testing.T) {
 	assert.False(t, hasStatus)
 	_, hasAssignee := fields["assignee"]
 	assert.False(t, hasAssignee)
+	assert.NotContains(t, fields, "attachment")
+}
+
+func TestIssueToMap_EmptyAttachments(t *testing.T) {
+	issue := &jira.Issue{Fields: &jira.IssueFields{Attachments: []*jira.Attachment{}}}
+	fields := issueToMap(issue)["fields"].(map[string]any)
+	assert.Equal(t, []map[string]any{}, fields["attachment"])
 }
 
 // --- default limit ---

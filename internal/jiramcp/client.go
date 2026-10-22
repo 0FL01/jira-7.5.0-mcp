@@ -12,6 +12,7 @@ import (
 // NOTE: Rich text (ADF) and field_options are NOT supported.
 type JiraClient interface {
 	GetIssue(ctx context.Context, key string, opts *jira.GetQueryOptions) (*jira.Issue, error)
+	GetAttachmentImage(ctx context.Context, id string) ([]byte, string, error)
 	// SearchIssues uses v2 API with offset-based pagination (startAt/maxResults)
 	SearchIssues(ctx context.Context, jql string, opts *jira.SearchOptionsV2) (*jira.SearchResultV2, error)
 	// CreateIssueV2 uses v2 API (Jira Server 7.x compatible)

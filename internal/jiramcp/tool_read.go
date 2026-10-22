@@ -16,7 +16,9 @@ type ReadArgs struct {
 
 	JQL string `json:"jql,omitempty" jsonschema:"JQL search query. Mutually exclusive with keys and resource."`
 
-	Resource string `json:"resource,omitempty" jsonschema:"Resource to list: projects, boards, sprints, sprint_issues. Mutually exclusive with keys and jql."`
+	Resource string `json:"resource,omitempty" jsonschema:"Resource to read: projects, boards, sprints, sprint_issues, attachment. Mutually exclusive with keys and jql."`
+
+	AttachmentID string `json:"attachment_id,omitempty" jsonschema:"Decimal attachment ID. Required for resource=attachment. Discover IDs using fields=attachment on an issue."`
 
 	BoardID     int    `json:"board_id,omitempty" jsonschema:"Board ID. Required for resource=sprints."`
 	SprintID    int    `json:"sprint_id,omitempty" jsonschema:"Sprint ID. Required for resource=sprint_issues."`
@@ -37,7 +39,11 @@ var readTool = &mcp.Tool{
 
 1. keys — Fetch issues by key. Pass one or more issue keys like ["PROJ-1", "PROJ-2"].
 2. jql — Search issues with JQL query. Supports all JIRA JQL syntax.
-3. resource — List a resource type: "projects", "boards", "sprints" (needs board_id), "sprint_issues" (needs sprint_id).
+3. resource — Read a resource: "projects", "boards", "sprints" (needs board_id), "sprint_issues" (needs sprint_id), "attachment" (needs attachment_id).
+
+Screenshots: first {"keys":["PROJ-1"],"fields":"summary,description,attachment"} to discover metadata,
+then {"resource":"attachment","attachment_id":"12345"} to view one native image.
+PNG/JPEG/GIF only, up to 5 MiB and 2048x2048. Original bytes, no resizing, disk storage, or cache.
 
 Common options: fields (comma-separated), expand, limit (default 100), start_at.
 Hint: Use jira_schema resource=transitions with an issue_key to find valid transition IDs before transitioning.`,
@@ -169,8 +175,26 @@ func (h *handlers) readResource(ctx context.Context, args ReadArgs) *mcp.CallToo
 		return h.readSprints(ctx, args)
 	case "sprint_issues":
 		return h.readSprintIssues(ctx, args)
+	case "attachment":
+		return h.readAttachment(ctx, args)
 	default:
-		return textResult(fmt.Sprintf("Unknown resource %q. Valid: projects, boards, sprints, sprint_issues.", args.Resource), true)
+		return textResult(fmt.Sprintf("Unknown resource %q. Valid: projects, boards, sprints, sprint_issues, attachment.", args.Resource), true)
+	}
+}
+
+func (h *handlers) readAttachment(ctx context.Context, args ReadArgs) *mcp.CallToolResult {
+	if args.AttachmentID == "" {
+		return textResult("attachment_id is required for resource=attachment. Hint: Fetch an issue with fields=attachment to find attachment IDs.", true)
+	}
+	data, mimeType, err := h.client.GetAttachmentImage(ctx, args.AttachmentID)
+	if err != nil {
+		return textResult(fmt.Sprintf("Failed to read attachment %s: %v", args.AttachmentID, err), true)
+	}
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{
+			&mcp.TextContent{Text: "Attachment " + args.AttachmentID},
+			&mcp.ImageContent{Data: data, MIMEType: mimeType},
+		},
 	}
 }
 
@@ -319,6 +343,22 @@ func issueToMap(issue *jira.Issue) map[string]any {
 		}
 		if issue.Fields.Labels != nil {
 			fields["labels"] = issue.Fields.Labels
+		}
+		if issue.Fields.Attachments != nil {
+			attachments := make([]map[string]any, 0, len(issue.Fields.Attachments))
+			for _, attachment := range issue.Fields.Attachments {
+				if attachment == nil {
+					continue
+				}
+				attachments = append(attachments, map[string]any{
+					"id":       attachment.ID,
+					"filename": attachment.Filename,
+					"mimeType": attachment.MimeType,
+					"size":     attachment.Size,
+					"content":  attachment.Content,
+				})
+			}
+			fields["attachment"] = attachments
 		}
 		if !time.Time(issue.Fields.Created).IsZero() {
 			fields["created"] = time.Time(issue.Fields.Created).Format(time.RFC3339)

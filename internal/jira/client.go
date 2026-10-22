@@ -2,9 +2,15 @@
 package jira
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"image"
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
+	"io"
 	"math"
 	"net/http"
 	"strconv"
@@ -43,7 +49,18 @@ func New(cfg Config) (*Client, error) {
 		Password: cfg.APIToken,
 	}
 
-	j, err := jira.NewClient(tp.Client(), cfg.URL)
+	httpClient := tp.Client()
+	// BasicAuthTransport reapplies credentials on every request, including redirects.
+	httpClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return fmt.Errorf("stopped after 10 redirects")
+		}
+		if req.URL.Scheme != via[0].URL.Scheme || req.URL.Host != via[0].URL.Host {
+			return fmt.Errorf("refusing cross-origin Jira redirect")
+		}
+		return nil
+	}
+	j, err := jira.NewClient(httpClient, cfg.URL)
 	if err != nil {
 		return nil, fmt.Errorf("create jira client: %w", err)
 	}
@@ -61,6 +78,49 @@ func (c *Client) GetIssue(ctx context.Context, key string, opts *jira.GetQueryOp
 		return resp, err
 	})
 	return issue, err
+}
+
+// GetAttachmentImage downloads one bounded image without reencoding or storing it.
+func (c *Client) GetAttachmentImage(ctx context.Context, id string) ([]byte, string, error) {
+	if id == "" {
+		return nil, "", fmt.Errorf("attachment_id must be a nonempty decimal ID")
+	}
+	for _, digit := range id {
+		if digit < '0' || digit > '9' {
+			return nil, "", fmt.Errorf("attachment_id must contain only decimal digits")
+		}
+	}
+
+	const maxBytes = 5 << 20
+	const maxDimension = 2048
+	var data []byte
+	err := c.retry(ctx, func() (*jira.Response, error) {
+		resp, err := c.j.Issue.DownloadAttachmentWithContext(ctx, id)
+		if err != nil {
+			return resp, err
+		}
+		// Read before retry closes the successful response body.
+		data, err = io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
+		if err != nil {
+			_ = resp.Body.Close()
+			return nil, fmt.Errorf("read attachment: %w", err)
+		}
+		return resp, nil
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	if len(data) > maxBytes {
+		return nil, "", fmt.Errorf("attachment exceeds 5 MiB; provide a smaller screenshot or crop")
+	}
+	config, format, err := image.DecodeConfig(bytes.NewReader(data))
+	if err != nil {
+		return nil, "", fmt.Errorf("attachment is not a supported PNG, JPEG, or GIF image: %w", err)
+	}
+	if config.Width <= 0 || config.Height <= 0 || config.Width > maxDimension || config.Height > maxDimension {
+		return nil, "", fmt.Errorf("attachment dimensions %dx%d exceed the supported range 1–2048 per side; provide a smaller screenshot or crop", config.Width, config.Height)
+	}
+	return data, "image/" + format, nil
 }
 
 // SearchOptionsV2 configures a JQL search via the v2 search endpoint.
