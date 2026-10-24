@@ -299,7 +299,7 @@ func (c *Client) GetSprintIssues(ctx context.Context, sprintID int) ([]jira.Issu
 			return nil, err
 		}
 		query := req.URL.Query()
-		query.Set("fields", "*navigable,comment")
+		query.Set("fields", "*navigable,comment,attachment")
 		req.URL.RawQuery = query.Encode()
 
 		var result struct {

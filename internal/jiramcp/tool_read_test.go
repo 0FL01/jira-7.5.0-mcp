@@ -73,23 +73,47 @@ func TestReadByKeys_PassesFieldsAndExpand(t *testing.T) {
 		fields string
 		want   string
 	}{
-		{"default", "", "*all,comment"},
-		{"selected fields", "summary,status", "summary,status,comment"},
-		{"existing comments", " summary, comment,comment ", "summary,comment"},
-		{"excluded comments", "summary,-comment", "summary,comment"},
-		{"only excluded comments", "-comment", "*all,comment"},
-		{"only exclusions", "-description", "*all,-description,comment"},
+		{"default", "", "*all,comment,attachment"},
+		{"summary only", "summary", "summary,comment,attachment"},
+		{"selected fields", "summary,status", "summary,status,comment,attachment"},
+		{"existing comments", " summary, comment,comment ", "summary,comment,attachment"},
+		{"existing attachments", " summary, attachment,attachment ", "summary,comment,attachment"},
+		{"excluded comments", "summary,-comment", "summary,comment,attachment"},
+		{"excluded attachments", "summary,-attachment", "summary,comment,attachment"},
+		{"only excluded comments", "-comment", "*all,comment,attachment"},
+		{"only excluded attachments", "-attachment", "*all,comment,attachment"},
+		{"only exclusions", "-description", "*all,-description,comment,attachment"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			mc := &mockClient{
 				GetIssueFn: func(_ context.Context, _ string, opts *jira.GetQueryOptions) (*jira.Issue, error) {
 					assert.Equal(t, tt.want, opts.Fields)
 					assert.Equal(t, "changelog", opts.Expand)
-					return &jira.Issue{Key: "P-1", Fields: &jira.IssueFields{Summary: "x"}}, nil
+					return &jira.Issue{
+						Key: "P-1",
+						Fields: &jira.IssueFields{
+							Summary: "x",
+							Attachments: []*jira.Attachment{{
+								ID: "12345", Filename: "screen.png", MimeType: "image/png", Size: 42,
+								Content: "https://jira.example.com/secure/attachment/12345/screen.png",
+							}},
+						},
+					}, nil
 				},
 			}
 			h := &handlers{client: mc}
-			callRead(t, h, ReadArgs{Keys: []string{"P-1"}, Fields: tt.fields, Expand: "changelog"})
+			text, isErr := callRead(t, h, ReadArgs{Keys: []string{"P-1"}, Fields: tt.fields, Expand: "changelog"})
+			assert.False(t, isErr)
+			parts := strings.SplitN(text, "\n\n", 2)
+			require.Len(t, parts, 2)
+			var records []map[string]any
+			require.NoError(t, json.Unmarshal([]byte(parts[1]), &records))
+			require.Len(t, records, 1)
+			fields := records[0]["fields"].(map[string]any)
+			assert.Equal(t, []any{map[string]any{
+				"id": "12345", "filename": "screen.png", "mimeType": "image/png", "size": float64(42),
+				"content": "https://jira.example.com/secure/attachment/12345/screen.png",
+			}}, fields["attachment"])
 		})
 	}
 }
@@ -100,7 +124,7 @@ func TestReadByKeys_MultipleKeys(t *testing.T) {
 			assert.Contains(t, jql, "issueKey in")
 			assert.Contains(t, jql, "A-1")
 			assert.Contains(t, jql, "B-2")
-			assert.Equal(t, []string{"*navigable", "comment"}, opts.Fields)
+			assert.Equal(t, []string{"*navigable", "comment", "attachment"}, opts.Fields)
 			return &jira.SearchResultV2{
 				Issues: []jira.Issue{
 					{Key: "A-1", Fields: &jira.IssueFields{Summary: "Issue A-1"}},
@@ -156,7 +180,7 @@ func TestReadByJQL_Success(t *testing.T) {
 		SearchIssuesFn: func(_ context.Context, jql string, opts *jira.SearchOptionsV2) (*jira.SearchResultV2, error) {
 			assert.Equal(t, "project = PROJ", jql)
 			assert.Equal(t, 100, opts.MaxResults) // default
-			assert.Equal(t, []string{"*navigable", "comment"}, opts.Fields)
+			assert.Equal(t, []string{"*navigable", "comment", "attachment"}, opts.Fields)
 			return &jira.SearchResultV2{
 				Issues: []jira.Issue{
 					{Key: "PROJ-1", Fields: &jira.IssueFields{Summary: "One"}},
@@ -196,7 +220,7 @@ func TestReadByJQL_Pagination(t *testing.T) {
 func TestReadByJQL_WithFields(t *testing.T) {
 	mc := &mockClient{
 		SearchIssuesFn: func(_ context.Context, _ string, opts *jira.SearchOptionsV2) (*jira.SearchResultV2, error) {
-			assert.Equal(t, []string{"summary", "status", "comment"}, opts.Fields)
+			assert.Equal(t, []string{"summary", "status", "comment", "attachment"}, opts.Fields)
 			return &jira.SearchResultV2{}, nil
 		},
 	}
@@ -576,7 +600,8 @@ func TestIssueToMap_MinimalFields(t *testing.T) {
 	assert.False(t, hasStatus)
 	_, hasAssignee := fields["assignee"]
 	assert.False(t, hasAssignee)
-	assert.NotContains(t, fields, "attachment")
+	assert.Contains(t, fields, "attachment")
+	assert.Nil(t, fields["attachment"])
 	assert.Contains(t, fields, "comment")
 	assert.Nil(t, fields["comment"])
 }

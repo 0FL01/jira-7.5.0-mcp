@@ -38,17 +38,20 @@ func newTestClient(t *testing.T, serverURL string) *Client {
 	return c
 }
 
-func TestGetSprintIssues_IncludesComments(t *testing.T) {
+func TestGetSprintIssues_IncludesCommentsAndAttachments(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, http.MethodGet, r.Method)
 		assert.Equal(t, "/jira/rest/agile/1.0/sprint/10/issue", r.URL.Path)
-		assert.Equal(t, "*navigable,comment", r.URL.Query().Get("fields"))
+		assert.Equal(t, "*navigable,comment,attachment", r.URL.Query().Get("fields"))
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"issues":[{"key":"PROJ-1","fields":{"summary":"Task","comment":{"comments":[{
 			"author":{"name":"test-user-1","displayName":"Тестовый Пользователь 1"},
 			"created":"2025-01-15T10:00:00.000+0300",
 			"body":"Тестовое уточнение требований"
-		}]}}}]}`))
+		}]},"attachment":[{
+			"id":"12345","filename":"screen.png","mimeType":"image/png","size":42,
+			"content":"https://jira.example.com/secure/attachment/12345/screen.png"
+		}]}}]}`))
 	}))
 	defer srv.Close()
 
@@ -65,6 +68,10 @@ func TestGetSprintIssues_IncludesComments(t *testing.T) {
 	assert.Equal(t, "Тестовый Пользователь 1", comment.Author.DisplayName)
 	assert.Equal(t, "2025-01-15T10:00:00.000+0300", comment.Created)
 	assert.Equal(t, "Тестовое уточнение требований", comment.Body)
+	assert.Equal(t, []*Attachment{{
+		ID: "12345", Filename: "screen.png", MimeType: "image/png", Size: 42,
+		Content: "https://jira.example.com/secure/attachment/12345/screen.png",
+	}}, issues[0].Fields.Attachments)
 }
 
 func TestGetAttachmentImage(t *testing.T) {
