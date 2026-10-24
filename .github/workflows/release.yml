@@ -108,33 +108,67 @@ jobs:
       - name: Test
         run: go test ./...
 
-      - name: Build and archive Linux amd64
+      - name: Build and archive Linux, macOS and Windows
         env:
           VERSION: ${{ steps.meta.outputs.tag }}
           BUILD_DATE: ${{ steps.meta.outputs.date }}
         run: |
           set -euo pipefail
           mkdir -p build release-assets
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
-            -ldflags "-s -w -X main.version=$VERSION -X main.commit=$GITHUB_SHA -X main.date=$BUILD_DATE" \
-            -o build/jira-mcp ./cmd/jira-mcp
-          tar -czf release-assets/jira-mcp_linux_amd64.tar.gz \
-            -C build jira-mcp -C "$GITHUB_WORKSPACE" LICENSE README.md
-          (cd release-assets && sha256sum jira-mcp_linux_amd64.tar.gz > checksums.txt)
+          for os in linux darwin windows; do
+            for arch in amd64 arm64; do
+              dir="build/${os}_${arch}"
+              binary=jira-mcp
+              [[ "$os" != windows ]] || binary+=.exe
+              mkdir -p "$dir"
+              CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build \
+                -ldflags "-s -w -X main.version=$VERSION -X main.commit=$GITHUB_SHA -X main.date=$BUILD_DATE" \
+                -o "$dir/$binary" ./cmd/jira-mcp
+              cp LICENSE README.md "$dir/"
+              asset="jira-mcp_${os}_${arch}"
+              if [[ "$os" == windows ]]; then
+                (cd "$dir" && zip -q "$GITHUB_WORKSPACE/release-assets/$asset.zip" "$binary" LICENSE README.md)
+              else
+                tar -czf "release-assets/$asset.tar.gz" -C "$dir" "$binary" LICENSE README.md
+              fi
+            done
+          done
+          (cd release-assets && sha256sum *.tar.gz *.zip > checksums.txt)
 
       - name: Verify release assets and finish notes
         run: |
           set -euo pipefail
-          test -s release-assets/jira-mcp_linux_amd64.tar.gz
           test -s release-assets/checksums.txt
           (cd release-assets && sha256sum --check checksums.txt)
-          mkdir -p build/verify
-          tar -xzf release-assets/jira-mcp_linux_amd64.tar.gz -C build/verify
-          file build/verify/jira-mcp | grep -q 'ELF 64-bit.*x86-64.*statically linked'
-          build/verify/jira-mcp --version
+          assets=(checksums.txt)
+          for os in linux darwin windows; do
+            for arch in amd64 arm64; do
+              dir="build/verify/${os}_${arch}"
+              binary=jira-mcp
+              asset="jira-mcp_${os}_${arch}"
+              mkdir -p "$dir"
+              if [[ "$os" == windows ]]; then
+                binary+=.exe
+                asset+=.zip
+                test -s "release-assets/$asset"
+                unzip -q "release-assets/$asset" -d "$dir"
+              else
+                asset+=.tar.gz
+                test -s "release-assets/$asset"
+                tar -xzf "release-assets/$asset" -C "$dir"
+              fi
+              cmp "build/${os}_${arch}/$binary" "$dir/$binary"
+              go version -m "$dir/$binary" > "$dir/build-info.txt"
+              grep -Fq "GOOS=$os" "$dir/build-info.txt"
+              grep -Fq "GOARCH=$arch" "$dir/build-info.txt"
+              assets+=("$asset")
+            done
+          done
+          file build/verify/linux_amd64/jira-mcp | grep -q 'ELF 64-bit.*x86-64.*statically linked'
+          build/verify/linux_amd64/jira-mcp --version
           {
             printf '\n## Artifacts\n\n'
-            printf -- '- `%s`\n' jira-mcp_linux_amd64.tar.gz checksums.txt
+            printf -- '- `%s`\n' "${assets[@]}"
           } >> .release-notes.md
 
       - name: Publish GitHub Release
@@ -145,7 +179,8 @@ jobs:
           target_commitish: ${{ github.sha }}
           body_path: .release-notes.md
           files: |
-            release-assets/jira-mcp_linux_amd64.tar.gz
+            release-assets/*.tar.gz
+            release-assets/*.zip
             release-assets/checksums.txt
           fail_on_unmatched_files: true
           make_latest: true
