@@ -68,15 +68,30 @@ func TestReadByKeys_Success(t *testing.T) {
 }
 
 func TestReadByKeys_PassesFieldsAndExpand(t *testing.T) {
-	mc := &mockClient{
-		GetIssueFn: func(_ context.Context, _ string, opts *jira.GetQueryOptions) (*jira.Issue, error) {
-			assert.Equal(t, "summary,status", opts.Fields)
-			assert.Equal(t, "changelog", opts.Expand)
-			return &jira.Issue{Key: "P-1", Fields: &jira.IssueFields{Summary: "x"}}, nil
-		},
+	for _, tt := range []struct {
+		name   string
+		fields string
+		want   string
+	}{
+		{"default", "", "*all,comment"},
+		{"selected fields", "summary,status", "summary,status,comment"},
+		{"existing comments", " summary, comment,comment ", "summary,comment"},
+		{"excluded comments", "summary,-comment", "summary,comment"},
+		{"only excluded comments", "-comment", "*all,comment"},
+		{"only exclusions", "-description", "*all,-description,comment"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			mc := &mockClient{
+				GetIssueFn: func(_ context.Context, _ string, opts *jira.GetQueryOptions) (*jira.Issue, error) {
+					assert.Equal(t, tt.want, opts.Fields)
+					assert.Equal(t, "changelog", opts.Expand)
+					return &jira.Issue{Key: "P-1", Fields: &jira.IssueFields{Summary: "x"}}, nil
+				},
+			}
+			h := &handlers{client: mc}
+			callRead(t, h, ReadArgs{Keys: []string{"P-1"}, Fields: tt.fields, Expand: "changelog"})
+		})
 	}
-	h := &handlers{client: mc}
-	callRead(t, h, ReadArgs{Keys: []string{"P-1"}, Fields: "summary,status", Expand: "changelog"})
 }
 
 func TestReadByKeys_MultipleKeys(t *testing.T) {
@@ -85,6 +100,7 @@ func TestReadByKeys_MultipleKeys(t *testing.T) {
 			assert.Contains(t, jql, "issueKey in")
 			assert.Contains(t, jql, "A-1")
 			assert.Contains(t, jql, "B-2")
+			assert.Equal(t, []string{"*navigable", "comment"}, opts.Fields)
 			return &jira.SearchResultV2{
 				Issues: []jira.Issue{
 					{Key: "A-1", Fields: &jira.IssueFields{Summary: "Issue A-1"}},
@@ -140,6 +156,7 @@ func TestReadByJQL_Success(t *testing.T) {
 		SearchIssuesFn: func(_ context.Context, jql string, opts *jira.SearchOptionsV2) (*jira.SearchResultV2, error) {
 			assert.Equal(t, "project = PROJ", jql)
 			assert.Equal(t, 100, opts.MaxResults) // default
+			assert.Equal(t, []string{"*navigable", "comment"}, opts.Fields)
 			return &jira.SearchResultV2{
 				Issues: []jira.Issue{
 					{Key: "PROJ-1", Fields: &jira.IssueFields{Summary: "One"}},
@@ -179,7 +196,7 @@ func TestReadByJQL_Pagination(t *testing.T) {
 func TestReadByJQL_WithFields(t *testing.T) {
 	mc := &mockClient{
 		SearchIssuesFn: func(_ context.Context, _ string, opts *jira.SearchOptionsV2) (*jira.SearchResultV2, error) {
-			assert.Equal(t, []string{"summary", "status"}, opts.Fields)
+			assert.Equal(t, []string{"summary", "status", "comment"}, opts.Fields)
 			return &jira.SearchResultV2{}, nil
 		},
 	}
@@ -560,6 +577,56 @@ func TestIssueToMap_MinimalFields(t *testing.T) {
 	_, hasAssignee := fields["assignee"]
 	assert.False(t, hasAssignee)
 	assert.NotContains(t, fields, "attachment")
+	assert.Contains(t, fields, "comment")
+	assert.Nil(t, fields["comment"])
+}
+
+func TestIssueToMap_Comments(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		data string
+		want string
+	}{
+		{
+			name: "full text and compact metadata",
+			data: `{"fields":{"comment":{"comments":[null,{
+				"id":"100",
+				"self":"https://jira.example.com/comment/100",
+				"author":{"name":"test-user-1","displayName":"Тестовый Пользователь 1","emailAddress":"user1@example.com","avatarUrls":{"48x48":"https://jira.example.com/avatar"}},
+				"created":"2025-01-15T10:00:00.000+0300",
+				"updated":"2025-01-16T11:00:00.000+0300",
+				"updateAuthor":{"name":"test-editor"},
+				"body":"Уточнение: сохранить исходное значение.\nСсылка: [пример|https://example.com]"
+			},{
+				"author":{"name":"test-user-2","displayName":"Тестовый Пользователь 2"},
+				"created":"2025-01-16T11:01:00.000+0300",
+				"body":"Тестовое согласование."
+			}]}}}`,
+			want: `[{
+				"author":{"name":"test-user-1","displayName":"Тестовый Пользователь 1"},
+				"created":"2025-01-15T10:00:00.000+0300",
+				"body":"Уточнение: сохранить исходное значение.\nСсылка: [пример|https://example.com]"
+			},{
+				"author":{"name":"test-user-2","displayName":"Тестовый Пользователь 2"},
+				"created":"2025-01-16T11:01:00.000+0300",
+				"body":"Тестовое согласование."
+			}]`,
+		},
+		{
+			name: "empty discussion",
+			data: `{"fields":{"comment":{"comments":[]}}}`,
+			want: `[]`,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var issue jira.Issue
+			require.NoError(t, json.Unmarshal([]byte(tt.data), &issue))
+			fields := issueToMap(&issue)["fields"].(map[string]any)
+			data, err := json.Marshal(fields["comment"])
+			require.NoError(t, err)
+			assert.JSONEq(t, tt.want, string(data))
+		})
+	}
 }
 
 func TestIssueToMap_EmptyAttachments(t *testing.T) {

@@ -38,6 +38,35 @@ func newTestClient(t *testing.T, serverURL string) *Client {
 	return c
 }
 
+func TestGetSprintIssues_IncludesComments(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodGet, r.Method)
+		assert.Equal(t, "/jira/rest/agile/1.0/sprint/10/issue", r.URL.Path)
+		assert.Equal(t, "*navigable,comment", r.URL.Query().Get("fields"))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"issues":[{"key":"PROJ-1","fields":{"summary":"Task","comment":{"comments":[{
+			"author":{"name":"test-user-1","displayName":"Тестовый Пользователь 1"},
+			"created":"2025-01-15T10:00:00.000+0300",
+			"body":"Тестовое уточнение требований"
+		}]}}}]}`))
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv.URL+"/jira")
+	issues, err := c.GetSprintIssues(context.Background(), 10)
+	require.NoError(t, err)
+	require.Len(t, issues, 1)
+	assert.Equal(t, "PROJ-1", issues[0].Key)
+	assert.Equal(t, "Task", issues[0].Fields.Summary)
+	require.NotNil(t, issues[0].Fields.Comments)
+	require.Len(t, issues[0].Fields.Comments.Comments, 1)
+	comment := issues[0].Fields.Comments.Comments[0]
+	assert.Equal(t, "test-user-1", comment.Author.Name)
+	assert.Equal(t, "Тестовый Пользователь 1", comment.Author.DisplayName)
+	assert.Equal(t, "2025-01-15T10:00:00.000+0300", comment.Created)
+	assert.Equal(t, "Тестовое уточнение требований", comment.Body)
+}
+
 func TestGetAttachmentImage(t *testing.T) {
 	var original bytes.Buffer
 	require.NoError(t, png.Encode(&original, image.NewRGBA(image.Rect(0, 0, 2, 1))))

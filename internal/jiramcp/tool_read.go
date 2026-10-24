@@ -31,7 +31,7 @@ type ReadArgs struct {
 	BoardType   string `json:"board_type,omitempty" jsonschema:"Filter boards by type: scrum, kanban."`
 	SprintState string `json:"sprint_state,omitempty" jsonschema:"Filter sprints by state: active, closed, future."`
 
-	Fields  string `json:"fields,omitempty" jsonschema:"Comma-separated field names to return (default: all)."`
+	Fields  string `json:"fields,omitempty" jsonschema:"Comma-separated issue fields. Default: all for one key, navigable for searches. Comments are always included."`
 	Expand  string `json:"expand,omitempty" jsonschema:"Comma-separated expansions (e.g. renderedFields transitions changelog)."`
 	Limit   int    `json:"limit,omitempty" jsonschema:"Max results to return. Default 100."`
 	StartAt int    `json:"start_at,omitempty" jsonschema:"Pagination offset for JQL search and resource listings. Jira Server 7.x uses offset-based pagination (not cursor-based)."`
@@ -44,6 +44,8 @@ var readTool = &mcp.Tool{
 1. keys — Fetch issues by key. Pass one or more issue keys like ["PROJ-1", "PROJ-2"].
 2. jql — Search issues with JQL query. Supports all JIRA JQL syntax.
 3. resource — Read a resource: "projects", "boards", "sprints" (needs board_id), "sprint_issues" (needs sprint_id), "attachment" (needs attachment_id).
+
+Issue reads always include fields.comment: full bodies, author usernames/full names, and publication dates. Consider comments alongside the issue description; they may change its interpretation. An empty array means the comment field is empty; null means Jira did not return it.
 
 Screenshots: first {"keys":["PROJ-1"],"fields":"summary,description,attachment"} to discover metadata,
 then {"resource":"attachment","attachment_id":"12345"} to view one native image.
@@ -91,13 +93,33 @@ func (h *handlers) handleRead(ctx context.Context, _ *mcp.CallToolRequest, args 
 	}
 }
 
+func issueFieldsWithComments(fields, defaultFields string) []string {
+	var result []string
+	hasInclusions := false
+	for _, field := range strings.Split(fields, ",") {
+		field = strings.TrimSpace(field)
+		if field == "" {
+			continue
+		}
+		if !strings.HasPrefix(field, "-") {
+			hasInclusions = true
+		}
+		if field != "comment" && field != "-comment" {
+			result = append(result, field)
+		}
+	}
+	if !hasInclusions {
+		result = append([]string{defaultFields}, result...)
+	}
+	return append(result, "comment")
+}
+
 func (h *handlers) readByKeys(ctx context.Context, args ReadArgs) *mcp.CallToolResult {
 	// For a single key use GetIssue (supports Expand, richer fields).
 	// For 2+ keys use a JQL search to reduce API calls.
 	if len(args.Keys) == 1 {
-		opts := &jira.GetQueryOptions{}
-		if args.Fields != "" {
-			opts.Fields = args.Fields
+		opts := &jira.GetQueryOptions{
+			Fields: strings.Join(issueFieldsWithComments(args.Fields, "*all"), ","),
 		}
 		if args.Expand != "" {
 			opts.Expand = args.Expand
@@ -116,11 +138,9 @@ func (h *handlers) readByKeys(ctx context.Context, args ReadArgs) *mcp.CallToolR
 	}
 	jql := fmt.Sprintf("issueKey in (%s)", strings.Join(quoted, ", "))
 
-	opts := &jira.SearchOptionsV2{MaxResults: len(args.Keys)}
-	if args.Fields != "" {
-		for _, f := range strings.Split(args.Fields, ",") {
-			opts.Fields = append(opts.Fields, strings.TrimSpace(f))
-		}
+	opts := &jira.SearchOptionsV2{
+		MaxResults: len(args.Keys),
+		Fields:     issueFieldsWithComments(args.Fields, "*navigable"),
 	}
 	if args.Expand != "" {
 		opts.Expand = args.Expand
@@ -142,11 +162,7 @@ func (h *handlers) readByJQL(ctx context.Context, args ReadArgs) *mcp.CallToolRe
 	opts := &jira.SearchOptionsV2{
 		MaxResults: args.Limit,
 		StartAt:    args.StartAt,
-	}
-	if args.Fields != "" {
-		for _, f := range strings.Split(args.Fields, ",") {
-			opts.Fields = append(opts.Fields, strings.TrimSpace(f))
-		}
+		Fields:     issueFieldsWithComments(args.Fields, "*navigable"),
 	}
 	if args.Expand != "" {
 		opts.Expand = args.Expand
@@ -356,6 +372,7 @@ func issueToMap(issue *jira.Issue) map[string]any {
 	if issue.Fields != nil {
 		fields := map[string]any{
 			"summary": issue.Fields.Summary,
+			"comment": nil,
 		}
 		if issue.Fields.Status != nil {
 			fields["status"] = issue.Fields.Status.Name
@@ -374,6 +391,23 @@ func issueToMap(issue *jira.Issue) map[string]any {
 		}
 		if issue.Fields.Labels != nil {
 			fields["labels"] = issue.Fields.Labels
+		}
+		if issue.Fields.Comments != nil {
+			comments := make([]map[string]any, 0, len(issue.Fields.Comments.Comments))
+			for _, comment := range issue.Fields.Comments.Comments {
+				if comment == nil {
+					continue
+				}
+				comments = append(comments, map[string]any{
+					"author": map[string]any{
+						"name":        comment.Author.Name,
+						"displayName": comment.Author.DisplayName,
+					},
+					"created": comment.Created,
+					"body":    comment.Body,
+				})
+			}
+			fields["comment"] = comments
 		}
 		if issue.Fields.Attachments != nil {
 			attachments := make([]map[string]any, 0, len(issue.Fields.Attachments))

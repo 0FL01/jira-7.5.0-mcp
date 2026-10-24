@@ -293,9 +293,23 @@ func (c *Client) GetAllSprints(ctx context.Context, boardID int, opts *jira.GetA
 func (c *Client) GetSprintIssues(ctx context.Context, sprintID int) ([]jira.Issue, error) {
 	var issues []jira.Issue
 	err := c.retry(ctx, func() (*jira.Response, error) {
-		var resp *jira.Response
-		var err error
-		issues, resp, err = c.j.Sprint.GetIssuesForSprintWithContext(ctx, sprintID)
+		path := fmt.Sprintf("rest/agile/1.0/sprint/%d/issue", sprintID)
+		req, err := c.j.NewRequestWithContext(ctx, "GET", path, nil)
+		if err != nil {
+			return nil, err
+		}
+		query := req.URL.Query()
+		query.Set("fields", "*navigable,comment")
+		req.URL.RawQuery = query.Encode()
+
+		var result struct {
+			Issues []jira.Issue `json:"issues"`
+		}
+		resp, err := c.j.Do(req, &result)
+		issues = result.Issues
+		if err != nil {
+			err = jira.NewJiraError(resp, err)
+		}
 		return resp, err
 	})
 	return issues, err
