@@ -1,38 +1,151 @@
 name: Release
 
 on:
-  workflow_dispatch:
-    inputs:
-      version:
-        description: 'Version (e.g., v0.2.0)'
-        required: true
-        type: string
+  push:
+    branches: [main]
 
 permissions:
-  contents: write
+  contents: read
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
-  release:
-    name: Build & Release
-    runs-on: ubuntu-latest
+  changes:
+    runs-on: ubuntu-24.04
+    outputs:
+      publish: ${{ steps.diff.outputs.publish }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 0
+          persist-credentials: false
+      - name: Detect release-relevant changes
+        id: diff
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          base="$BEFORE_SHA"
+          if [[ -z "$base" || "$base" =~ ^0+$ ]]; then
+            base=$(git hash-object -t tree -w /dev/null)
+          elif ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            git fetch --no-tags origin "$base"
+          fi
+          status=0
+          git diff --quiet --no-renames "$base" "$GITHUB_SHA" -- \
+            . ':(exclude,glob)**/*.md' || status=$?
+          case "$status" in
+            0) echo 'publish=false' >> "$GITHUB_OUTPUT" ;;
+            1) echo 'publish=true' >> "$GITHUB_OUTPUT" ;;
+            *) exit "$status" ;;
+          esac
 
-      - uses: actions/setup-go@v6
+  release:
+    needs: changes
+    if: needs.changes.outputs.publish == 'true'
+    name: Build & Release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    concurrency:
+      group: release-${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
 
-      - name: Create tag
-        run: |
-          git tag ${{ inputs.version }}
-          git push origin ${{ inputs.version }}
-
-      - uses: goreleaser/goreleaser-action@v6
-        with:
-          distribution: goreleaser
-          version: "~> v2"
-          args: release --clean
+      - name: Release metadata and commit notes
+        id: meta
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          short_sha=$(git rev-parse --short=12 "$GITHUB_SHA")
+          epoch=$(git show -s --format=%ct "$GITHUB_SHA")
+          day=$(date -u -d "@$epoch" +%Y%m%d)
+          tag="release-$day-$short_sha"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u -d "@$epoch" +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          previous=$(git describe --tags --match 'release-*' --abbrev=0 \
+            "$GITHUB_SHA^" 2>/dev/null || true)
+          base="$previous"
+          if [[ -z "$base" && -n "$BEFORE_SHA" && ! "$BEFORE_SHA" =~ ^0+$ ]]; then
+            if ! git cat-file -e "$BEFORE_SHA^{commit}" 2>/dev/null; then
+              git fetch --no-tags origin "$BEFORE_SHA"
+            fi
+            base="$BEFORE_SHA"
+          fi
+          range="$GITHUB_SHA"
+          [[ -z "$base" ]] || range="$base..$GITHUB_SHA"
+          url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+          {
+            printf '# %s\n\n' "$tag"
+            if [[ -n "$previous" ]]; then
+              printf 'Previous release: [%s](%s/releases/tag/%s)\n\n' \
+                "$previous" "$url" "$previous"
+            elif [[ -n "$base" ]]; then
+              printf 'Previous commit: [%s](%s/commit/%s)\n\n' "$base" "$url" "$base"
+            else
+              printf 'Initial release.\n\n'
+            fi
+            printf 'New commits: %s\n\n' "$(git rev-list --count "$range")"
+            git log --reverse --format="- [%h]($url/commit/%H) %s" "$range"
+            if [[ -n "$base" ]]; then
+              printf '\n[Full diff](%s/compare/%s...%s)\n' "$url" "$base" "$GITHUB_SHA"
+            fi
+          } > .release-notes.md
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build and archive Linux amd64
+        env:
+          VERSION: ${{ steps.meta.outputs.tag }}
+          BUILD_DATE: ${{ steps.meta.outputs.date }}
+        run: |
+          set -euo pipefail
+          mkdir -p build release-assets
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+            -ldflags "-s -w -X main.version=$VERSION -X main.commit=$GITHUB_SHA -X main.date=$BUILD_DATE" \
+            -o build/jira-mcp ./cmd/jira-mcp
+          tar -czf release-assets/jira-mcp_linux_amd64.tar.gz \
+            -C build jira-mcp -C "$GITHUB_WORKSPACE" LICENSE README.md
+          (cd release-assets && sha256sum jira-mcp_linux_amd64.tar.gz > checksums.txt)
+
+      - name: Verify release assets and finish notes
+        run: |
+          set -euo pipefail
+          test -s release-assets/jira-mcp_linux_amd64.tar.gz
+          test -s release-assets/checksums.txt
+          (cd release-assets && sha256sum --check checksums.txt)
+          mkdir -p build/verify
+          tar -xzf release-assets/jira-mcp_linux_amd64.tar.gz -C build/verify
+          file build/verify/jira-mcp | grep -q 'ELF 64-bit.*x86-64.*statically linked'
+          build/verify/jira-mcp --version
+          {
+            printf '\n## Artifacts\n\n'
+            printf -- '- `%s`\n' jira-mcp_linux_amd64.tar.gz checksums.txt
+          } >> .release-notes.md
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          body_path: .release-notes.md
+          files: |
+            release-assets/jira-mcp_linux_amd64.tar.gz
+            release-assets/checksums.txt
+          fail_on_unmatched_files: true
+          make_latest: true
