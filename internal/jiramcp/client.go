@@ -3,6 +3,7 @@ package jiramcp
 import (
 	"context"
 	"encoding/json"
+	"net/http"
 
 	"github.com/mmatczuk/jira-mcp/internal/jira"
 )
@@ -12,6 +13,7 @@ import (
 // NOTE: Rich text (ADF) and field_options are NOT supported.
 type JiraClient interface {
 	GetIssue(ctx context.Context, key string, opts *jira.GetQueryOptions) (*jira.Issue, error)
+	OpenAttachment(ctx context.Context, id string) (*http.Response, error)
 	GetAttachmentImage(ctx context.Context, id string) ([]byte, string, error)
 	// SearchIssues uses v2 API with offset-based pagination (startAt/maxResults)
 	SearchIssues(ctx context.Context, jql string, opts *jira.SearchOptionsV2) (*jira.SearchResultV2, error)

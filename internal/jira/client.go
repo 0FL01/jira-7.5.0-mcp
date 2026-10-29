@@ -80,35 +80,44 @@ func (c *Client) GetIssue(ctx context.Context, key string, opts *jira.GetQueryOp
 	return issue, err
 }
 
-// GetAttachmentImage downloads one bounded image without reencoding or storing it.
-func (c *Client) GetAttachmentImage(ctx context.Context, id string) ([]byte, string, error) {
+// OpenAttachment opens one attachment without buffering or validating its contents.
+// The caller must close the returned response's Body.
+func (c *Client) OpenAttachment(ctx context.Context, id string) (*http.Response, error) {
 	if id == "" {
-		return nil, "", fmt.Errorf("attachment_id must be a nonempty decimal ID")
+		return nil, fmt.Errorf("attachment_id must be a nonempty decimal ID")
 	}
 	for _, digit := range id {
 		if digit < '0' || digit > '9' {
-			return nil, "", fmt.Errorf("attachment_id must contain only decimal digits")
+			return nil, fmt.Errorf("attachment_id must contain only decimal digits")
 		}
 	}
 
-	const maxBytes = 5 << 20
-	const maxDimension = 2048
-	var data []byte
+	var response *http.Response
 	err := c.retry(ctx, func() (*jira.Response, error) {
 		resp, err := c.j.Issue.DownloadAttachmentWithContext(ctx, id)
 		if err != nil {
 			return resp, err
 		}
-		// Read before retry closes the successful response body.
-		data, err = io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
-		if err != nil {
-			_ = resp.Body.Close()
-			return nil, fmt.Errorf("read attachment: %w", err)
-		}
-		return resp, nil
+		response = resp.Response
+		// Transfer Body ownership to the caller instead of closing it in retry.
+		return nil, nil
 	})
+	return response, err
+}
+
+// GetAttachmentImage downloads one bounded image without reencoding or storing it.
+func (c *Client) GetAttachmentImage(ctx context.Context, id string) ([]byte, string, error) {
+	resp, err := c.OpenAttachment(ctx, id)
 	if err != nil {
 		return nil, "", err
+	}
+	defer resp.Body.Close()
+
+	const maxBytes = 5 << 20
+	const maxDimension = 2048
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
+	if err != nil {
+		return nil, "", fmt.Errorf("read attachment: %w", err)
 	}
 	if len(data) > maxBytes {
 		return nil, "", fmt.Errorf("attachment exceeds 5 MiB; provide a smaller screenshot or crop")

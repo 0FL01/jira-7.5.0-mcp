@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 
 	"github.com/mmatczuk/jira-mcp/internal/jira"
 )
@@ -12,6 +13,7 @@ import (
 // test needs; unset methods panic with a clear message.
 type mockClient struct {
 	GetIssueFn           func(ctx context.Context, key string, opts *jira.GetQueryOptions) (*jira.Issue, error)
+	OpenAttachmentFn     func(ctx context.Context, id string) (*http.Response, error)
 	GetAttachmentImageFn func(ctx context.Context, id string) ([]byte, string, error)
 	SearchIssuesFn       func(ctx context.Context, jql string, opts *jira.SearchOptionsV2) (*jira.SearchResultV2, error)
 	CreateIssueV2Fn      func(ctx context.Context, payload map[string]any) (string, string, error)
@@ -35,6 +37,13 @@ func (m *mockClient) GetIssue(ctx context.Context, key string, opts *jira.GetQue
 		panic(fmt.Sprintf("mockClient.GetIssue called but GetIssueFn not set (key=%s)", key))
 	}
 	return m.GetIssueFn(ctx, key, opts)
+}
+
+func (m *mockClient) OpenAttachment(ctx context.Context, id string) (*http.Response, error) {
+	if m.OpenAttachmentFn == nil {
+		panic(fmt.Sprintf("mockClient.OpenAttachment called but OpenAttachmentFn not set (id=%s)", id))
+	}
+	return m.OpenAttachmentFn(ctx, id)
 }
 
 func (m *mockClient) GetAttachmentImage(ctx context.Context, id string) ([]byte, string, error) {

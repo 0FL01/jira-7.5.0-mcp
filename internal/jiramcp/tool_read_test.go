@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/mmatczuk/jira-mcp/internal/jira"
@@ -391,6 +394,16 @@ func TestReadSprintIssues_NoSprintID(t *testing.T) {
 
 // --- readResource: attachment ---
 
+type attachmentReadCloser struct {
+	io.Reader
+	closed bool
+}
+
+func (r *attachmentReadCloser) Close() error {
+	r.closed = true
+	return nil
+}
+
 func TestReadAttachment_Image(t *testing.T) {
 	original := []byte("original image bytes")
 	h := &handlers{client: &mockClient{
@@ -420,49 +433,73 @@ func TestReadAttachment_MissingID(t *testing.T) {
 }
 
 func TestReadAttachment_Download(t *testing.T) {
-	dir := t.TempDir()
-	original := []byte("original image bytes")
-	h := &handlers{client: &mockClient{
-		GetAttachmentImageFn: func(_ context.Context, id string) ([]byte, string, error) {
-			assert.Equal(t, "12345", id)
-			return original, "image/png", nil
-		},
-	}}
-	var paths []string
-	for range 2 {
-		result, output, err := h.handleRead(context.Background(), nil, ReadArgs{
-			Resource: "attachment", AttachmentID: "12345", DownloadDir: dir,
+	for _, tt := range []struct {
+		name        string
+		contentType string
+		mimeType    string
+		body        string
+		extension   string
+	}{
+		{"PNG", "image/png", "image/png", "original image bytes", ".png"},
+		{"MP4", "video/mp4", "video/mp4", "\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom", ""},
+		{"fallback", "", "application/octet-stream", "original attachment bytes", ".bin"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			var source *attachmentReadCloser
+			h := &handlers{client: &mockClient{
+				OpenAttachmentFn: func(_ context.Context, id string) (*http.Response, error) {
+					assert.Equal(t, "12345", id)
+					source = &attachmentReadCloser{Reader: strings.NewReader(tt.body)}
+					return &http.Response{
+						Header: http.Header{
+							"Content-Type":        {tt.contentType},
+							"Content-Disposition": {`attachment; filename="clip.` + strings.Repeat("x", 240) + `"`},
+						},
+						Body: source,
+					}, nil
+				},
+			}}
+			var paths []string
+			for range 2 {
+				result, output, err := h.handleRead(context.Background(), nil, ReadArgs{
+					Resource: "attachment", AttachmentID: "12345", DownloadDir: dir,
+				})
+				require.NoError(t, err)
+				assert.Nil(t, output)
+				assert.Nil(t, result.StructuredContent)
+				assert.False(t, result.IsError)
+				assert.True(t, source.closed)
+				require.Len(t, result.Content, 1)
+				text, ok := result.Content[0].(*mcp.TextContent)
+				require.True(t, ok)
+				parts := strings.SplitN(text.Text, "\n\n", 2)
+				require.Len(t, parts, 2)
+				var records []map[string]any
+				require.NoError(t, json.Unmarshal([]byte(parts[1]), &records))
+				require.Len(t, records, 1)
+				assert.Equal(t, "12345", records[0]["id"])
+				assert.Equal(t, tt.mimeType, records[0]["mimeType"])
+				assert.Equal(t, float64(len(tt.body)), records[0]["size"])
+				path, ok := records[0]["path"].(string)
+				require.True(t, ok)
+				assert.Equal(t, dir, filepath.Dir(path))
+				assert.True(t, strings.HasPrefix(filepath.Base(path), "jira-attachment-12345-"))
+				if tt.extension != "" {
+					assert.Equal(t, tt.extension, filepath.Ext(path))
+				}
+				paths = append(paths, path)
+			}
+			assert.NotEqual(t, paths[0], paths[1], "repeated downloads must not overwrite an earlier file")
+			for _, path := range paths {
+				data, err := os.ReadFile(path)
+				require.NoError(t, err)
+				assert.Equal(t, []byte(tt.body), data)
+				info, err := os.Stat(path)
+				require.NoError(t, err)
+				assert.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+			}
 		})
-		require.NoError(t, err)
-		assert.Nil(t, output)
-		assert.Nil(t, result.StructuredContent)
-		assert.False(t, result.IsError)
-		require.Len(t, result.Content, 1)
-		text, ok := result.Content[0].(*mcp.TextContent)
-		require.True(t, ok)
-		parts := strings.SplitN(text.Text, "\n\n", 2)
-		require.Len(t, parts, 2)
-		var records []map[string]any
-		require.NoError(t, json.Unmarshal([]byte(parts[1]), &records))
-		require.Len(t, records, 1)
-		assert.Equal(t, "12345", records[0]["id"])
-		assert.Equal(t, "image/png", records[0]["mimeType"])
-		assert.Equal(t, float64(len(original)), records[0]["size"])
-		path, ok := records[0]["path"].(string)
-		require.True(t, ok)
-		assert.Equal(t, dir, filepath.Dir(path))
-		assert.True(t, strings.HasPrefix(filepath.Base(path), "jira-attachment-12345-"))
-		assert.Equal(t, ".png", filepath.Ext(path))
-		paths = append(paths, path)
-	}
-	assert.NotEqual(t, paths[0], paths[1], "repeated downloads must not overwrite an earlier file")
-	for _, path := range paths {
-		data, err := os.ReadFile(path)
-		require.NoError(t, err)
-		assert.Equal(t, original, data)
-		info, err := os.Stat(path)
-		require.NoError(t, err)
-		assert.Equal(t, os.FileMode(0o600), info.Mode().Perm())
 	}
 }
 
@@ -474,26 +511,40 @@ func TestReadAttachment_DownloadErrors(t *testing.T) {
 		name      string
 		directory string
 		clientErr error
+		copyErr   error
 		want      string
 		wantCalls int
 	}{
-		{"relative directory", "relative/workspace", nil, "download_dir must be an absolute path", 0},
-		{"missing directory", filepath.Join(dir, "missing"), nil, "Failed to save attachment", 1},
-		{"not a directory", notDirectory, nil, "Failed to save attachment", 1},
-		{"client error", dir, fmt.Errorf("not found"), "Failed to read attachment 12345: not found", 1},
+		{"relative directory", "relative/workspace", nil, nil, "download_dir must be an absolute path", 0},
+		{"missing directory", filepath.Join(dir, "missing"), nil, nil, "Failed to save attachment", 1},
+		{"not a directory", notDirectory, nil, nil, "Failed to save attachment", 1},
+		{"client error", dir, fmt.Errorf("not found"), nil, "Failed to read attachment 12345: not found", 1},
+		{"partial read", dir, nil, fmt.Errorf("stream interrupted"), "stream interrupted", 1},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			calls := 0
+			var source *attachmentReadCloser
 			h := &handlers{client: &mockClient{
-				GetAttachmentImageFn: func(context.Context, string) ([]byte, string, error) {
+				OpenAttachmentFn: func(context.Context, string) (*http.Response, error) {
 					calls++
-					return []byte("original image bytes"), "image/png", tt.clientErr
+					if tt.clientErr != nil {
+						return nil, tt.clientErr
+					}
+					var reader io.Reader = strings.NewReader("original image bytes")
+					if tt.copyErr != nil {
+						reader = io.MultiReader(reader, iotest.ErrReader(tt.copyErr))
+					}
+					source = &attachmentReadCloser{Reader: reader}
+					return &http.Response{Header: http.Header{"Content-Type": {"image/png"}}, Body: source}, nil
 				},
 			}}
 			text, isErr := callRead(t, h, ReadArgs{Resource: "attachment", AttachmentID: "12345", DownloadDir: tt.directory})
 			assert.True(t, isErr)
 			assert.Contains(t, text, tt.want)
 			assert.Equal(t, tt.wantCalls, calls)
+			if source != nil {
+				assert.True(t, source.closed)
+			}
 			entries, err := os.ReadDir(dir)
 			require.NoError(t, err)
 			require.Len(t, entries, 1, "failed downloads must not create files or directories")

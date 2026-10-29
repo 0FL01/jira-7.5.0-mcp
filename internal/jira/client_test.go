@@ -74,6 +74,34 @@ func TestGetSprintIssues_IncludesCommentsAndAttachments(t *testing.T) {
 	}}, issues[0].Fields.Attachments)
 }
 
+func TestOpenAttachment(t *testing.T) {
+	original := append([]byte("\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom"), bytes.Repeat([]byte{0xab}, 5<<20)...)
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "video/mp4")
+		w.(http.Flusher).Flush()
+		select {
+		case <-release:
+			_, _ = w.Write(original)
+		case <-r.Context().Done():
+		}
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c := newTestClient(t, srv.URL)
+	resp, err := c.OpenAttachment(ctx, "12345")
+	// The body is unavailable until opening returns, so buffering would time out.
+	close(release)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, "video/mp4", resp.Header.Get("Content-Type"))
+	data, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.Equal(t, original, data)
+}
+
 func TestGetAttachmentImage(t *testing.T) {
 	var original bytes.Buffer
 	require.NoError(t, png.Encode(&original, image.NewRGBA(image.Rect(0, 0, 2, 1))))

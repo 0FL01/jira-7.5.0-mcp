@@ -28,7 +28,7 @@ func NewServer(client JiraClient) *mcp.Server {
 
 const instructions = `JIRA MCP Server — interact with JIRA Server/Data Center 7.x via three tools:
 
-- jira_read: Fetch issues by key, search by JQL, list resources (projects, boards, sprints, sprint issues), or view/download an attachment image.
+- jira_read: Fetch issues by key, search by JQL, list resources (projects, boards, sprints, sprint issues), view an attachment image, or download any attachment.
 - jira_write: Create, update, delete, transition issues; add/edit comments; move issues to sprints; add/update/delete worklogs (time tracking). Supports batch (array of items). Always has dry_run option.
 - jira_schema: Discover fields, transitions — metadata needed to construct valid jira_write payloads.
 
@@ -39,4 +39,4 @@ Workflow tips:
 4. Descriptions and comments use plain text or wiki markup (NOT Markdown/ADF — Jira Server 7.x limitation).
 5. Time tracking: use add_worklog action (timetracking field is read-only in Jira Server).
 6. Screenshots: fetch an issue with fields=summary,description,attachment to discover attachment IDs, then jira_read resource=attachment attachment_id=<id> to view one image. PNG/JPEG/GIF only, at most 5 MiB and 2048x2048; originals are not resized or cached. By default images stay only in memory in this server; client history is outside its control.
-7. To download a screenshot into your workspace instead, add download_dir=<existing absolute directory on the MCP server filesystem>. The response contains a unique file path, MIME type, and size, not image/base64 content. Open that path with your local image reader, then delete the file when finished. Existing files are not overwritten. The directory is supplied explicitly because the server working directory may differ from your workspace.`
+7. To download any attachment (MP4, PDF, archives, images, etc.), add download_dir=<existing absolute path to your current workspace on the MCP server filesystem>. Downloads stream original bytes without application size, dimension, or format limits. The response contains a unique private file path, MIME type, and actual saved size, not image/base64 content. Process the path with an appropriate local tool and remove the file when no longer needed. Existing files are not overwritten. The directory is supplied explicitly because the server working directory may differ from your workspace.`
