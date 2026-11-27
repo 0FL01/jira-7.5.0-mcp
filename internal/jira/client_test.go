@@ -38,6 +38,26 @@ func newTestClient(t *testing.T, serverURL string) *Client {
 	return c
 }
 
+func TestAddWorklogCanonicalTimestampAndNoReplay(t *testing.T) {
+	calls := make(chan string, 4)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodPost, r.Method)
+		assert.Equal(t, "/rest/api/2/issue/NEW-1/worklog", r.URL.Path)
+		var body WorklogInput
+		assert.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		calls <- body.Started
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+	c := newTestClient(t, srv.URL)
+	_, err := c.AddWorklog(context.Background(), "NEW-1", WorklogInput{Started: "2026-11-24T00:15:00.000+03:00", TimeSpentSeconds: 60}, EstimateAuto, "", "")
+	var we *WorklogWriteError
+	require.ErrorAs(t, err, &we)
+	require.True(t, we.Uncertain)
+	require.Len(t, calls, 1)
+	require.Equal(t, "2026-11-24T00:15:00.000+0300", <-calls)
+}
+
 func TestGetSprintIssues_IncludesCommentsAndAttachments(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, http.MethodGet, r.Method)

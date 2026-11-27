@@ -13,20 +13,23 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/andygrunwald/go-jira"
+	"github.com/google/go-querystring/query"
 )
 
 // Config holds JIRA connection settings.
 type Config struct {
-	URL        string
-	Email      string
-	APIToken   string
-	MaxRetries int           // Default: 3
-	BaseDelay  time.Duration // Default: 1s
+	URL             string
+	Email           string
+	APIToken        string
+	MaxRetries      int           // Default: 3
+	BaseDelay       time.Duration // Default: 1s
+	RequestInterval time.Duration // Optional pause between HTTP requests.
 }
 
 // Client wraps go-jira with retry on 429 at the call level.
@@ -50,6 +53,9 @@ func New(cfg Config) (*Client, error) {
 	}
 
 	httpClient := tp.Client()
+	if cfg.RequestInterval > 0 {
+		httpClient.Transport = &pacedTransport{next: httpClient.Transport, interval: cfg.RequestInterval, gate: make(chan struct{}, 1)}
+	}
 	// BasicAuthTransport reapplies credentials on every request, including redirects.
 	httpClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		if len(via) >= 10 {
@@ -70,14 +76,68 @@ func New(cfg Config) (*Client, error) {
 
 // GetIssue fetches an issue by key.
 func (c *Client) GetIssue(ctx context.Context, key string, opts *jira.GetQueryOptions) (*jira.Issue, error) {
-	var issue *jira.Issue
+	var data issueJSON
 	err := c.retry(ctx, func() (*jira.Response, error) {
-		var resp *jira.Response
-		var err error
-		issue, resp, err = c.j.Issue.GetWithContext(ctx, key, opts)
-		return resp, err
+		req, err := c.j.NewRequestWithContext(ctx, http.MethodGet, "rest/api/2/issue/"+url.PathEscape(key), nil)
+		if err != nil {
+			return nil, err
+		}
+		if opts != nil {
+			q, err := query.Values(opts)
+			if err != nil {
+				return nil, err
+			}
+			req.URL.RawQuery = q.Encode()
+		}
+		return c.j.Do(req, &data)
 	})
-	return issue, err
+	if err != nil {
+		return nil, err
+	}
+	return &data.Issue, nil
+}
+
+// go-jira decodes the inline comment bodies but drops their pagination metadata.
+type issueJSON struct{ jira.Issue }
+
+const commentPageKey = "_jiraMCPCommentPage"
+
+func (i *issueJSON) UnmarshalJSON(data []byte) error {
+	if err := json.Unmarshal(data, &i.Issue); err != nil {
+		return err
+	}
+	if i.Fields == nil || i.Fields.Comments == nil {
+		return nil
+	}
+	var meta struct {
+		Fields struct {
+			Comment *struct {
+				StartAt    int  `json:"startAt"`
+				MaxResults int  `json:"maxResults"`
+				Total      *int `json:"total"`
+			} `json:"comment"`
+		} `json:"fields"`
+	}
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return err
+	}
+	if p := meta.Fields.Comment; p != nil && p.Total != nil {
+		i.Fields.Unknowns[commentPageKey] = PageInfo{StartAt: p.StartAt, MaxResults: p.MaxResults, Total: *p.Total}
+	}
+	return nil
+}
+
+func InlineCommentPage(fields *IssueFields) (PageInfo, bool) {
+	p, ok := fields.Unknowns[commentPageKey].(PageInfo)
+	return p, ok
+}
+
+func issuesFromJSON(data []issueJSON) []jira.Issue {
+	issues := make([]jira.Issue, len(data))
+	for n := range data {
+		issues[n] = data[n].Issue
+	}
+	return issues
 }
 
 // OpenAttachment opens one attachment without buffering or validating its contents.
@@ -181,16 +241,22 @@ func (c *Client) SearchIssues(ctx context.Context, jql string, opts *SearchOptio
 		}
 
 		var result struct {
-			Issues     []jira.Issue `json:"issues"`
-			Total      int          `json:"total"`
-			StartAt    int          `json:"startAt"`
-			MaxResults int          `json:"maxResults"`
-			IsLast     bool         `json:"isLast"`
+			Issues     []issueJSON `json:"issues"`
+			Total      *int        `json:"total"`
+			StartAt    int         `json:"startAt"`
+			MaxResults int         `json:"maxResults"`
+			IsLast     bool        `json:"isLast"`
 		}
 		resp, err := c.j.Do(req, &result)
+		if err != nil {
+			return resp, err
+		}
+		if result.Total == nil {
+			return resp, fmt.Errorf("Jira search response is missing total")
+		}
 		sr = SearchResultV2{
-			Issues:     result.Issues,
-			Total:      result.Total,
+			Issues:     issuesFromJSON(result.Issues),
+			Total:      *result.Total,
 			StartAt:    result.StartAt,
 			MaxResults: result.MaxResults,
 			IsLast:     result.IsLast,
@@ -312,10 +378,10 @@ func (c *Client) GetSprintIssues(ctx context.Context, sprintID int) ([]jira.Issu
 		req.URL.RawQuery = query.Encode()
 
 		var result struct {
-			Issues []jira.Issue `json:"issues"`
+			Issues []issueJSON `json:"issues"`
 		}
 		resp, err := c.j.Do(req, &result)
-		issues = result.Issues
+		issues = issuesFromJSON(result.Issues)
 		if err != nil {
 			err = jira.NewJiraError(resp, err)
 		}
@@ -409,20 +475,54 @@ func (c *Client) GetFieldOptions(ctx context.Context, fieldID string) ([]json.Ra
 	return nil, fmt.Errorf("field_options is not supported on Jira Server 7.x: REST API v2 does not provide an endpoint for custom field options")
 }
 
-// GetWorklogs returns all worklogs for an issue.
+func (c *Client) GetComments(ctx context.Context, issueKey string, startAt, limit int) (*CommentPage, error) {
+	var result CommentPage
+	err := c.retry(ctx, func() (*jira.Response, error) {
+		path := "rest/api/2/issue/" + url.PathEscape(issueKey) + "/comment"
+		q := url.Values{"startAt": {strconv.Itoa(startAt)}, "maxResults": {strconv.Itoa(limit)}}
+		req, err := c.j.NewRequestWithContext(ctx, http.MethodGet, path+"?"+q.Encode(), nil)
+		if err != nil {
+			return nil, err
+		}
+		return c.j.Do(req, &result)
+	})
+	return &result, err
+}
+
+func (c *Client) GetMyself(ctx context.Context) (*User, error) {
+	var user *User
+	err := c.retry(ctx, func() (*jira.Response, error) {
+		var resp *jira.Response
+		var err error
+		user, resp, err = c.j.User.GetSelfWithContext(ctx)
+		return resp, err
+	})
+	return user, err
+}
+
+// GetWorklogs returns the issue worklog list as supplied by Jira Server 7.5.
 // GET /rest/api/2/issue/{issueIdOrKey}/worklog
 func (c *Client) GetWorklogs(ctx context.Context, issueKey string) (*WorklogList, error) {
-	var result WorklogList
+	var result struct {
+		WorklogList
+		Total *int `json:"total"`
+	}
 	err := c.retry(ctx, func() (*jira.Response, error) {
-		path := fmt.Sprintf("rest/api/2/issue/%s/worklog", issueKey)
+		path := fmt.Sprintf("rest/api/2/issue/%s/worklog", url.PathEscape(issueKey))
 		req, err := c.j.NewRequestWithContext(ctx, "GET", path, nil)
 		if err != nil {
 			return nil, err
 		}
-		resp, err := c.j.Do(req, &result)
-		return resp, err
+		return c.j.Do(req, &result)
 	})
-	return &result, err
+	if err != nil {
+		return nil, err
+	}
+	if result.Total == nil {
+		return nil, fmt.Errorf("Jira worklog response is missing total")
+	}
+	result.WorklogList.Total = *result.Total
+	return &result.WorklogList, nil
 }
 
 // AddWorklog adds a worklog to an issue.
@@ -433,33 +533,68 @@ func (c *Client) GetWorklogs(ctx context.Context, issueKey string) (*WorklogList
 //   - "leave": leaves unchanged
 //   - "manual": reduces by reduceBy value
 func (c *Client) AddWorklog(ctx context.Context, issueKey string, input WorklogInput, adjustEstimate EstimateAdjustment, newEstimate, reduceBy string) (*Worklog, error) {
+	input, err := normalizeWorklogInput(input)
+	if err != nil {
+		return nil, err
+	}
 	var result Worklog
-	err := c.retry(ctx, func() (*jira.Response, error) {
-		path := fmt.Sprintf("rest/api/2/issue/%s/worklog", issueKey)
+	path := "rest/api/2/issue/" + url.PathEscape(issueKey) + "/worklog"
+	params := make(url.Values)
+	if adjustEstimate != "" {
+		params.Set("adjustEstimate", string(adjustEstimate))
+	}
+	if newEstimate != "" {
+		params.Set("newEstimate", newEstimate)
+	}
+	if reduceBy != "" {
+		params.Set("reduceBy", reduceBy)
+	}
+	if len(params) > 0 {
+		path += "?" + params.Encode()
+	}
+	req, err := c.j.NewRequestWithContext(ctx, http.MethodPost, path, input)
+	if err != nil {
+		return nil, err
+	}
+	// A proxy error or lost response can occur after creation. Never replay this POST.
+	resp, err := c.j.Do(req, &result)
+	defer closeResp(resp)
+	if err != nil {
+		uncertain := resp == nil || resp.StatusCode < 400 || resp.StatusCode >= 500 || resp.StatusCode == http.StatusRequestTimeout
+		return nil, &WorklogWriteError{Err: enrichError(resp, err), Uncertain: uncertain}
+	}
+	if result.ID == "" {
+		return nil, &WorklogWriteError{Err: fmt.Errorf("Jira returned no worklog ID"), Uncertain: true}
+	}
+	return &result, nil
+}
 
-		// Build query parameters
-		params := make([]string, 0)
-		if adjustEstimate != "" {
-			params = append(params, fmt.Sprintf("adjustEstimate=%s", adjustEstimate))
-		}
-		if newEstimate != "" {
-			params = append(params, fmt.Sprintf("newEstimate=%s", newEstimate))
-		}
-		if reduceBy != "" {
-			params = append(params, fmt.Sprintf("reduceBy=%s", reduceBy))
-		}
-		if len(params) > 0 {
-			path = path + "?" + strings.Join(params, "&")
-		}
+const WorklogTimestamp = "2006-01-02T15:04:05.000-0700"
 
-		req, err := c.j.NewRequestWithContext(ctx, "POST", path, input)
+type WorklogWriteError struct {
+	Err       error
+	Uncertain bool
+}
+
+func (e *WorklogWriteError) Error() string { return e.Err.Error() }
+func (e *WorklogWriteError) Unwrap() error { return e.Err }
+
+func ParseWorklogTime(s string) (time.Time, error) {
+	if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
+		return t, nil
+	}
+	return time.Parse("2006-01-02T15:04:05-0700", s)
+}
+
+func normalizeWorklogInput(input WorklogInput) (WorklogInput, error) {
+	if input.Started != "" {
+		t, err := ParseWorklogTime(input.Started)
 		if err != nil {
-			return nil, err
+			return input, fmt.Errorf("invalid started timestamp: use ISO 8601 with an explicit UTC offset")
 		}
-		resp, err := c.j.Do(req, &result)
-		return resp, err
-	})
-	return &result, err
+		input.Started = t.Format(WorklogTimestamp)
+	}
+	return input, nil
 }
 
 // UpdateWorklog updates an existing worklog.
@@ -471,8 +606,12 @@ func (c *Client) AddWorklog(ctx context.Context, issueKey string, input WorklogI
 //
 // Note: "manual" is not supported for updates in Jira 7.5.0
 func (c *Client) UpdateWorklog(ctx context.Context, issueKey, worklogID string, input WorklogInput, adjustEstimate EstimateAdjustment, newEstimate string) (*Worklog, error) {
+	input, err := normalizeWorklogInput(input)
+	if err != nil {
+		return nil, err
+	}
 	var result Worklog
-	err := c.retry(ctx, func() (*jira.Response, error) {
+	err = c.retry(ctx, func() (*jira.Response, error) {
 		path := fmt.Sprintf("rest/api/2/issue/%s/worklog/%s", issueKey, worklogID)
 
 		// Build query parameters

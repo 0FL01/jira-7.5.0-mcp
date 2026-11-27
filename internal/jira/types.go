@@ -7,6 +7,7 @@ import "github.com/andygrunwald/go-jira"
 
 type (
 	Attachment           = jira.Attachment
+	Comment              = jira.Comment
 	Board                = jira.Board
 	BoardListOptions     = jira.BoardListOptions
 	Field                = jira.Field
@@ -25,6 +26,17 @@ type (
 	Transition           = jira.Transition
 	User                 = jira.User
 )
+
+type PageInfo struct {
+	StartAt    int `json:"startAt"`
+	MaxResults int `json:"maxResults"`
+	Total      int `json:"total"`
+}
+
+type CommentPage struct {
+	PageInfo
+	Comments []*Comment `json:"comments"`
+}
 
 // Worklog represents a time tracking entry for an issue.
 // Compatible with Jira Server/Data Center 7.x REST API v2.

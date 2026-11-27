@@ -1,5 +1,9 @@
 package jiramcp
 
+import "sync"
+
 type handlers struct {
-	client JiraClient
+	client    JiraClient
+	reportMu  sync.Mutex
+	uncertain map[worklogIdentity]bool
 }

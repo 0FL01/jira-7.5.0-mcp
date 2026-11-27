@@ -13,6 +13,8 @@ import (
 // NOTE: Rich text (ADF) and field_options are NOT supported.
 type JiraClient interface {
 	GetIssue(ctx context.Context, key string, opts *jira.GetQueryOptions) (*jira.Issue, error)
+	GetComments(ctx context.Context, key string, startAt, limit int) (*jira.CommentPage, error)
+	GetMyself(ctx context.Context) (*jira.User, error)
 	OpenAttachment(ctx context.Context, id string) (*http.Response, error)
 	GetAttachmentImage(ctx context.Context, id string) ([]byte, string, error)
 	// SearchIssues uses v2 API with offset-based pagination (startAt/maxResults)

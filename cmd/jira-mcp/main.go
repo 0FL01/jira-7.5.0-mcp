@@ -36,12 +36,21 @@ func main() {
 		return
 	}
 
+	var interval time.Duration
+	if s := os.Getenv("JIRA_REQUEST_INTERVAL"); s != "" {
+		var err error
+		interval, err = time.ParseDuration(s)
+		if err != nil || interval < 0 {
+			log.Fatal("Invalid JIRA_REQUEST_INTERVAL: use a non-negative duration such as 10s")
+		}
+	}
 	client, err := jira.New(jira.Config{
-		URL:        requireEnv("JIRA_URL"),
-		Email:      requireEnv("JIRA_EMAIL"),
-		APIToken:   requireEnv("JIRA_API_TOKEN"),
-		MaxRetries: 3,
-		BaseDelay:  time.Second,
+		URL:             requireEnv("JIRA_URL"),
+		Email:           requireEnv("JIRA_EMAIL"),
+		APIToken:        requireEnv("JIRA_API_TOKEN"),
+		MaxRetries:      3,
+		BaseDelay:       time.Second,
+		RequestInterval: interval,
 	})
 	if err != nil {
 		log.Fatalf("Failed to create JIRA client: %v", err)

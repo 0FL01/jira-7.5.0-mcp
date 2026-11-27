@@ -21,7 +21,10 @@ type ReadArgs struct {
 
 	JQL string `json:"jql,omitempty" jsonschema:"JQL search query. Mutually exclusive with keys and resource."`
 
-	Resource string `json:"resource,omitempty" jsonschema:"Resource to read: projects, boards, sprints, sprint_issues, attachment. Mutually exclusive with keys and jql."`
+	Resource string `json:"resource,omitempty" jsonschema:"Resource: projects, boards, sprints, sprint_issues, attachment, comments, worklogs. Mutually exclusive with keys and jql."`
+	IssueKey string `json:"issue_key,omitempty" jsonschema:"Issue key for comments or worklogs by issue."`
+	FromDate string `json:"from_date,omitempty" jsonschema:"Inclusive YYYY-MM-DD for own worklogs by period; omit issue_key."`
+	ToDate   string `json:"to_date,omitempty" jsonschema:"Inclusive YYYY-MM-DD for own worklogs by period; omit issue_key."`
 
 	AttachmentID string `json:"attachment_id,omitempty" jsonschema:"Decimal attachment ID. Required for resource=attachment. Discover IDs using fields=attachment on an issue."`
 	DownloadDir  string `json:"download_dir,omitempty" jsonschema:"Existing absolute directory on the MCP server filesystem. Only for resource=attachment: stream any attachment here and return its path instead of inline content. For nonimages pass the agent's current workspace. Remove the file when no longer needed."`
@@ -45,9 +48,9 @@ var readTool = &mcp.Tool{
 
 1. keys — Fetch issues by key. Pass one or more issue keys like ["PROJ-1", "PROJ-2"].
 2. jql — Search issues with JQL query. Supports all JIRA JQL syntax.
-3. resource — Read a resource: "projects", "boards", "sprints" (needs board_id), "sprint_issues" (needs sprint_id), "attachment" (needs attachment_id).
+3. resource — Read a resource: "projects", "boards", "sprints" (needs board_id), "sprint_issues" (needs sprint_id), "attachment" (needs attachment_id), "comments" (issue_key and optional start_at/limit), "worklogs" (issue_key OR from_date/to_date for your own entries and daily totals in your Jira profile timezone).
 
-Issue reads always include fields.comment: full bodies, author usernames/full names, and publication dates, and fields.attachment: id, filename, mimeType, size, and content URL (not file bytes). Consider comments and attachments alongside the issue description; they may change its interpretation. An empty array means the field is empty; null means Jira did not return it.
+Issue reads include fields.comment (bodies, authors, and dates), and fields.attachment metadata. If fields.comment_page.complete is false, use resource=comments to fetch all pages. Request fields=issuelinks,subtasks alongside other fields to see the issue's relationships and children. An empty array means the field is empty; null means Jira did not return it.
 
 Attachments: first {"keys":["PROJ-1"],"fields":"summary,description,attachment"} to discover metadata,
 then {"resource":"attachment","attachment_id":"12345"} to view one native image.
@@ -207,9 +210,33 @@ func (h *handlers) readResource(ctx context.Context, args ReadArgs) *mcp.CallToo
 		return h.readSprintIssues(ctx, args)
 	case "attachment":
 		return h.readAttachment(ctx, args)
+	case "comments":
+		return h.readComments(ctx, args)
+	case "worklogs":
+		return h.readWorklogs(ctx, args)
 	default:
-		return textResult(fmt.Sprintf("Unknown resource %q. Valid: projects, boards, sprints, sprint_issues, attachment.", args.Resource), true)
+		return textResult(fmt.Sprintf("Unknown resource %q. Valid: projects, boards, sprints, sprint_issues, attachment, comments, worklogs.", args.Resource), true)
 	}
+}
+
+func (h *handlers) readComments(ctx context.Context, args ReadArgs) *mcp.CallToolResult {
+	key, err := normalizeIssueKey(args.IssueKey)
+	if err != nil || args.StartAt < 0 || args.Limit < 1 {
+		return textResult("comments requires issue_key, nonnegative start_at and positive limit.", true)
+	}
+	page, err := h.client.GetComments(ctx, key, args.StartAt, args.Limit)
+	if err != nil {
+		return textResult(fmt.Sprintf("Failed to read comments on %s: %v", key, err), true)
+	}
+	res := map[string]any{"issue_key": key, "start_at": page.StartAt, "limit": page.MaxResults, "total": page.Total, "comments": compactComments(page.Comments, true)}
+	next := page.StartAt + len(page.Comments)
+	if next < page.Total {
+		if len(page.Comments) == 0 || next <= args.StartAt {
+			return textResult("Jira comment pagination did not advance.", true)
+		}
+		res["next_start_at"] = next
+	}
+	return jsonResult("Comment page", res, false)
 }
 
 func (h *handlers) readAttachment(ctx context.Context, args ReadArgs) *mcp.CallToolResult {
@@ -414,21 +441,40 @@ func issueToMap(issue *jira.Issue) map[string]any {
 			fields["labels"] = issue.Fields.Labels
 		}
 		if issue.Fields.Comments != nil {
-			comments := make([]map[string]any, 0, len(issue.Fields.Comments.Comments))
-			for _, comment := range issue.Fields.Comments.Comments {
-				if comment == nil {
+			comments := compactComments(issue.Fields.Comments.Comments, false)
+			fields["comment"] = comments
+			if p, ok := jira.InlineCommentPage(issue.Fields); ok {
+				fields["comment_page"] = map[string]any{"start_at": p.StartAt, "limit": p.MaxResults, "total": p.Total, "complete": p.StartAt == 0 && len(comments) == p.Total}
+			}
+		}
+		if issue.Fields.IssueLinks != nil {
+			links := make([]map[string]any, 0, len(issue.Fields.IssueLinks))
+			for _, l := range issue.Fields.IssueLinks {
+				if l == nil {
 					continue
 				}
-				comments = append(comments, map[string]any{
-					"author": map[string]any{
-						"name":        comment.Author.Name,
-						"displayName": comment.Author.DisplayName,
-					},
-					"created": comment.Created,
-					"body":    comment.Body,
-				})
+				for _, end := range []struct {
+					direction, label string
+					issue            *jira.Issue
+				}{{"inward", l.Type.Inward, l.InwardIssue}, {"outward", l.Type.Outward, l.OutwardIssue}} {
+					if end.issue == nil {
+						continue
+					}
+					link := compactRelatedIssue(end.issue.Key, end.issue.Fields)
+					link["type"], link["direction"], link["label"] = l.Type.Name, end.direction, end.label
+					links = append(links, link)
+				}
 			}
-			fields["comment"] = comments
+			fields["issuelinks"] = links
+		}
+		if issue.Fields.Subtasks != nil {
+			children := make([]map[string]any, 0, len(issue.Fields.Subtasks))
+			for _, subtask := range issue.Fields.Subtasks {
+				if subtask != nil {
+					children = append(children, compactRelatedIssue(subtask.Key, &subtask.Fields))
+				}
+			}
+			fields["subtasks"] = children
 		}
 		if issue.Fields.Attachments != nil {
 			attachments := make([]map[string]any, 0, len(issue.Fields.Attachments))
@@ -456,6 +502,42 @@ func issueToMap(issue *jira.Issue) map[string]any {
 	}
 
 	return m
+}
+
+func compactRelatedIssue(key string, f *jira.IssueFields) map[string]any {
+	result := map[string]any{"key": key}
+	if f != nil {
+		if f.Summary != "" {
+			result["summary"] = f.Summary
+		}
+		if f.Status != nil {
+			result["status"] = f.Status.Name
+		}
+	}
+	return result
+}
+
+func compactComments(source []*jira.Comment, includeID bool) []map[string]any {
+	comments := make([]map[string]any, 0, len(source))
+	for _, c := range source {
+		if c == nil {
+			continue
+		}
+		m := map[string]any{"author": map[string]any{"name": c.Author.Name, "displayName": c.Author.DisplayName}, "created": c.Created, "body": c.Body}
+		if includeID && c.ID != "" {
+			m["id"] = c.ID
+		}
+		comments = append(comments, m)
+	}
+	return comments
+}
+
+func jsonResult(label string, value any, failed bool) *mcp.CallToolResult {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return textResult(fmt.Sprintf("Failed to serialize result: %v", err), true)
+	}
+	return textResult(label+"\n\n"+string(data), failed)
 }
 
 func formatReadResult(summary string, results []map[string]any, errors []string) *mcp.CallToolResult {

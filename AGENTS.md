@@ -19,8 +19,9 @@ internal/mdconv/  - Markdown to ADF converter (legacy, not used)
 - `cmd/jira-mcp/main.go` - startup, env vars (JIRA_URL, JIRA_EMAIL, JIRA_API_TOKEN)
 - `internal/jira/client.go` - all Jira API calls with exponential backoff on 429
 - `internal/jiramcp/server.go` - tool registration, instructions text
-- `internal/jiramcp/tool_read.go` - jira_read handler (keys/JQL/resource modes)
+- `internal/jiramcp/tool_read.go` - jira_read handler; `worklogs.go` handles Jira 7.5 worklog reads and local-day filtering
 - `internal/jiramcp/tool_write.go` - jira_write handler (create/update/delete/transition/comment/worklog)
+- `internal/jiramcp/tool_worklog_report.go` - Jira-backed report preview, confirmation, and duplicate checks
 - `internal/jiramcp/tool_schema.go` - jira_schema handler (fields/transitions only)
 - `internal/mdconv/mdconv.go` - Markdown to ADF converter (legacy, unused)
 
@@ -50,7 +51,7 @@ internal/mdconv/  - Markdown to ADF converter (legacy, not used)
 - Handlers live in tool_*.go files
 
 ### jira_read Tool
-- Modes (mutually exclusive): keys (1+ issue keys), jql (search), resource (projects/boards/sprints/sprint_issues)
+- Modes (mutually exclusive): keys, jql, or resource (including paged comments and worklogs by key or own date range)
 - Single key → GetIssue (supports expand); 2+ keys → JQL search
 - Fields, expand, limit, pagination via start_at (offset-based)
 
@@ -64,6 +65,7 @@ internal/mdconv/  - Markdown to ADF converter (legacy, not used)
 ### Worklog (Time Tracking)
 - IMPORTANT: timetracking/timeSpent fields are READ-ONLY in Jira Server 7.x
 - Use `add_worklog` action instead to log time
+- Use `submit_worklogs` for confirmed reports; never replay an ambiguous worklog POST without reconciliation. Workflow and limits: [README.md](README.md#issue-context-and-time-reports).
 - API endpoint: POST /rest/api/2/issue/{key}/worklog
 - add_worklog requires: key, time_spent (e.g., "3h 30m") OR time_spent_seconds
 - Optional: comment, started (ISO 8601), adjust_estimate, visibility

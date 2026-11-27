@@ -45,9 +45,11 @@ type WriteItem struct {
 }
 
 type WriteArgs struct {
-	Action string      `json:"action" jsonschema:"Action: create, update, delete, transition, comment, edit_comment, move_to_sprint."`
-	Items  []WriteItem `json:"items" jsonschema:"Array of items to process. Even a single operation should be wrapped in an array."`
-	DryRun bool        `json:"dry_run,omitempty" jsonschema:"Preview changes without applying them. Default false."`
+	Action       string         `json:"action" jsonschema:"Action: create, update, delete, transition, comment, edit_comment, move_to_sprint, add_worklog, update_worklog, delete_worklog, submit_worklogs."`
+	Items        []WriteItem    `json:"items" jsonschema:"Array of items to process. Even a single operation should be wrapped in an array."`
+	DryRun       bool           `json:"dry_run,omitempty" jsonschema:"Preview changes without applying them. Default false."`
+	Confirmation string         `json:"confirmation,omitempty" jsonschema:"Only for submit_worklogs: omit to preview, then pass the preview token after human approval."`
+	DayTargets   map[string]int `json:"day_targets,omitempty" jsonschema:"Only for submit_worklogs: optional exact daily targets in seconds by YYYY-MM-DD for confirmed exceptions to 8h."`
 }
 
 var writeTool = &mcp.Tool{
@@ -70,6 +72,7 @@ Actions:
 - add_worklog: Add time tracking entry. Each item needs: key, time_spent (e.g., '3h 20m') OR time_spent_seconds. Optional: comment, started (ISO 8601), adjust_estimate, new_estimate, reduce_by, visibility_type, visibility_value.
 - update_worklog: Update worklog. Each item needs: key, worklog_id. Optional: time_spent, time_spent_seconds, comment, started, adjust_estimate, new_estimate, visibility_type, visibility_value.
 - delete_worklog: Delete worklog. Each item needs: key, worklog_id. Optional: adjust_estimate, new_estimate, increase_by.
+- submit_worklogs: Reconcile and submit a confirmed time report. Items need key, time_spent_seconds, started (explicit offset), and comment. First omit confirmation for a Jira-backed preview. After human approval call again with identical input and the returned confirmation token. Existing matches are skipped; only days with the exact expected total (8h by default) are written. Use day_targets for approved exceptions.
 
 Time tracking note: timetracking/timeSpent/worklog fields are read-only in Jira Server. Use add_worklog action instead.
 
@@ -83,6 +86,9 @@ func (h *handlers) handleWrite(ctx context.Context, _ *mcp.CallToolRequest, args
 
 	if args.Action == "move_to_sprint" {
 		return h.handleMoveToSprint(ctx, args), nil, nil
+	}
+	if args.Action == "submit_worklogs" {
+		return h.submitWorklogs(ctx, args), nil, nil
 	}
 
 	var results []string
@@ -112,7 +118,7 @@ func (h *handlers) handleWrite(ctx context.Context, _ *mcp.CallToolRequest, args
 		case "delete_worklog":
 			msg, err = h.writeDeleteWorklog(ctx, item, args.DryRun)
 		default:
-			return textResult(fmt.Sprintf("Unknown action %q. Valid: create, update, delete, transition, comment, edit_comment, move_to_sprint, add_worklog, update_worklog, delete_worklog.", args.Action), true), nil, nil
+			return textResult(fmt.Sprintf("Unknown action %q. Valid: create, update, delete, transition, comment, edit_comment, move_to_sprint, add_worklog, update_worklog, delete_worklog, submit_worklogs.", args.Action), true), nil, nil
 		}
 
 		if err != nil {
@@ -439,7 +445,7 @@ func (h *handlers) writeAddWorklog(ctx context.Context, item WriteItem, dryRun b
 
 	worklog, err := h.client.AddWorklog(ctx, item.Key, input, adjustEstimate, item.NewEstimate, item.ReduceBy)
 	if err != nil {
-		return "", fmt.Errorf("failed to add worklog to %s: %w. Hint: Ensure time tracking is enabled in Jira project settings and you have 'Work On Issues' permission", item.Key, err)
+		return "", fmt.Errorf("failed to add worklog to %s: %w. Verify the issue worklogs before retrying", item.Key, err)
 	}
 
 	var timeInfo string

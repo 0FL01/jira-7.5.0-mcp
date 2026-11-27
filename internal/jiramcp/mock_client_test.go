@@ -13,6 +13,10 @@ import (
 // test needs; unset methods panic with a clear message.
 type mockClient struct {
 	GetIssueFn           func(ctx context.Context, key string, opts *jira.GetQueryOptions) (*jira.Issue, error)
+	GetCommentsFn        func(ctx context.Context, key string, startAt, limit int) (*jira.CommentPage, error)
+	GetMyselfFn          func(context.Context) (*jira.User, error)
+	GetWorklogsFn        func(context.Context, string) (*jira.WorklogList, error)
+	AddWorklogFn         func(context.Context, string, jira.WorklogInput) (*jira.Worklog, error)
 	OpenAttachmentFn     func(ctx context.Context, id string) (*http.Response, error)
 	GetAttachmentImageFn func(ctx context.Context, id string) ([]byte, string, error)
 	SearchIssuesFn       func(ctx context.Context, jql string, opts *jira.SearchOptionsV2) (*jira.SearchResultV2, error)
@@ -37,6 +41,14 @@ func (m *mockClient) GetIssue(ctx context.Context, key string, opts *jira.GetQue
 		panic(fmt.Sprintf("mockClient.GetIssue called but GetIssueFn not set (key=%s)", key))
 	}
 	return m.GetIssueFn(ctx, key, opts)
+}
+
+func (m *mockClient) GetComments(ctx context.Context, key string, startAt, limit int) (*jira.CommentPage, error) {
+	return m.GetCommentsFn(ctx, key, startAt, limit)
+}
+
+func (m *mockClient) GetMyself(ctx context.Context) (*jira.User, error) {
+	return m.GetMyselfFn(ctx)
 }
 
 func (m *mockClient) OpenAttachment(ctx context.Context, id string) (*http.Response, error) {
@@ -159,11 +171,11 @@ func (m *mockClient) GetFieldOptions(ctx context.Context, fieldID string) ([]jso
 }
 
 func (m *mockClient) GetWorklogs(ctx context.Context, issueKey string) (*jira.WorklogList, error) {
-	panic(fmt.Sprintf("mockClient.GetWorklogs not implemented (issueKey=%s)", issueKey))
+	return m.GetWorklogsFn(ctx, issueKey)
 }
 
 func (m *mockClient) AddWorklog(ctx context.Context, issueKey string, input jira.WorklogInput, adjustEstimate jira.EstimateAdjustment, newEstimate, reduceBy string) (*jira.Worklog, error) {
-	panic(fmt.Sprintf("mockClient.AddWorklog not implemented (issueKey=%s)", issueKey))
+	return m.AddWorklogFn(ctx, issueKey, input)
 }
 
 func (m *mockClient) UpdateWorklog(ctx context.Context, issueKey, worklogID string, input jira.WorklogInput, adjustEstimate jira.EstimateAdjustment, newEstimate string) (*jira.Worklog, error) {
